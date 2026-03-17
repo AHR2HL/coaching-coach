@@ -482,7 +482,14 @@ def send_question_to_student(student_name, week):
     if len(questions_only) > 3500:
         questions_only = questions_only[:3500] + "\n\n_(truncated)_"
 
-    message = f"Hey {student_name.split()[0]}! Here are your practice questions for our upcoming call:\n\n{questions_only}\n\nComplete these before we meet!"
+    # Get call date/time
+    call = get_next_call(student_name)
+    if call:
+        call_info = f"\n\n*Our call:* {call['date'].strftime('%A %b %d')} at {call['time']} CT"
+    else:
+        call_info = ""
+
+    message = f"Hey {student_name.split()[0]}! Here are your practice questions for our upcoming call:{call_info}\n\n{questions_only}\n\nComplete these before we meet!"
 
     success, msg = send_slack_dm(info.get('email', ''), message)
 
@@ -566,6 +573,15 @@ def send_question_via_email(student_name, week):
     # Extract questions only (before rubric)
     questions_only = content.split('<details')[0].strip()
 
+    # Get call date/time
+    call = get_next_call(student_name)
+    if call:
+        call_info_text = f"\nOur call: {call['date'].strftime('%A %b %d')} at {call['time']} CT\n"
+        call_info_html = f"<p><strong>Our call:</strong> {call['date'].strftime('%A %b %d')} at {call['time']} CT</p>"
+    else:
+        call_info_text = ""
+        call_info_html = ""
+
     # Create email subject and body
     first_name = student_name.split()[0]
     subject = f"AP Practice Questions - Week {week}"
@@ -573,7 +589,7 @@ def send_question_via_email(student_name, week):
     body_text = f"""Hey {first_name}!
 
 Here are your practice questions for our upcoming coaching call:
-
+{call_info_text}
 {questions_only}
 
 Complete these before we meet!
@@ -588,6 +604,7 @@ AP Coaching
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px;">
         <h2>Hey {first_name}!</h2>
         <p>Here are your practice questions for our upcoming coaching call:</p>
+        {call_info_html}
         <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
             <pre style="white-space: pre-wrap; font-family: inherit;">{questions_only}</pre>
         </div>
