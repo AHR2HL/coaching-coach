@@ -39,6 +39,19 @@ DO NOT assume a fixed offset. Calculate based on the actual date:
 - **Dashboard:** Flask app on `localhost:5000`
 - **Student data:** `student_plans_v3/` (gitignored, private)
 
+## Document Versions (IMPORTANT)
+
+**Always use the latest version.** The V3 data lives in the folder structure:
+
+| Data | Location | Notes |
+|------|----------|-------|
+| **Individual student plans** | `student_plans_v3/*.md` | THIS IS V3 - always use this |
+| **Student questions** | `student_plans_v3/questions/` | Weekly question sets |
+| **Master schedule** | `student_plans_v3/MASTER_COACHING_SCHEDULE.md` | Auto-generated from dashboard |
+| Historical reference | `COACHING_PLAN.md`, `PERSONALIZED_LEARNING_PLANS*.md` | V2.0 - for background only |
+
+**When briefing on a student:** Read from `student_plans_v3/StudentName.md` first, not the root-level planning docs.
+
 ## Sending Messages
 
 Via dashboard API:
