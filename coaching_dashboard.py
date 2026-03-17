@@ -153,6 +153,9 @@ STUDENTS = {
     'Michael Cai': {'email': 'michael.cai@alpha.school', 'course': 'AP World History', 'tier': 'Maintenance'},
 }
 
+# SCHEDULE is the source of truth for coaching calls.
+# After editing, run: python sync_schedule.py
+# This keeps MASTER_COACHING_SCHEDULE.md in sync.
 SCHEDULE = [
     {'date': (2026, 3, 12), 'time': '09:00', 'student': 'Gus Castillo', 'week': 1},
     {'date': (2026, 3, 17), 'time': '08:30', 'student': 'Emma Cotner', 'week': 1},
