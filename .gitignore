@@ -60,3 +60,7 @@ practice_tests.csv
 # API/LLM generated data
 uworld_*.json
 ap*_practice_tests_built.json
+
+# Dashboard state files (student data)
+recommendation_lock.json
+ap_comms_history.json

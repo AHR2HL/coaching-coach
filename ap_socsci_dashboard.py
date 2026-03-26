@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-AP Social Studies Dashboard
+Unified AP Dashboard
 
-Unified view of all AP Gov, APUSH, AP World, and APHG students.
-Combines data from:
-- Timeback (tracker + XP)
-- Austin Way (adaptive platform mastery)
-- Practice Tests
+Main entry point for:
+- AP Social Studies tracking (home page)
+- Coaching schedule and calls (/coaching)
+- Communications center (/comms)
 
 Run: python ap_socsci_dashboard.py
-Open: http://localhost:5001
+Open: http://localhost:5000
 """
 
 import os
@@ -17,14 +16,32 @@ import re
 import csv
 import json
 import time
+import smtplib
 import requests
 import pandas as pd
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request, redirect, url_for
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+
+# Optional Slack integration
+try:
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+    SLACK_AVAILABLE = True
+except ImportError:
+    SLACK_AVAILABLE = False
+
+# Optional OpenAI integration
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 load_dotenv()
 
@@ -60,6 +77,476 @@ load_env_from_json()
 app = Flask(__name__)
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / 'adam_ss_bundle'
+CONFIG_FILE = BASE_DIR / 'dashboard_config.json'
+COMMS_HISTORY_FILE = BASE_DIR / 'ap_comms_history.json'
+RECOMMENDATION_LOCK_FILE = BASE_DIR / 'recommendation_lock.json'
+
+# =============================================================================
+# CONFIG MANAGEMENT
+# =============================================================================
+
+def load_config():
+    """Load dashboard configuration."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_config(config):
+    """Save dashboard configuration."""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+# =============================================================================
+# SLACK INTEGRATION
+# =============================================================================
+
+slack_client = None
+
+def init_slack():
+    """Initialize Slack client."""
+    global slack_client
+    if not SLACK_AVAILABLE:
+        return False
+    config = load_config()
+    token = config.get('slack_token') or os.environ.get('SLACK_BOT_TOKEN', '')
+    if token:
+        slack_client = WebClient(token=token)
+        return True
+    return False
+
+def send_slack_dm(email, message):
+    """Send a direct message to a user via Slack."""
+    if not slack_client:
+        return False, "Slack not configured"
+    try:
+        response = slack_client.users_lookupByEmail(email=email)
+        user_id = response['user']['id']
+        slack_client.chat_postMessage(channel=user_id, text=message)
+        return True, "Sent"
+    except SlackApiError as e:
+        return False, str(e.response['error'])
+    except Exception as e:
+        return False, str(e)
+
+# =============================================================================
+# EMAIL INTEGRATION
+# =============================================================================
+
+def get_email_config():
+    """Get email SMTP configuration."""
+    config = load_config()
+    return {
+        'smtp_server': config.get('smtp_server', 'smtp.sendgrid.net'),
+        'smtp_port': config.get('smtp_port', 587),
+        'smtp_username': config.get('smtp_username', ''),
+        'smtp_password': config.get('smtp_password', ''),
+        'from_email': config.get('from_email', ''),
+        'from_name': config.get('from_name', 'AP Coaching')
+    }
+
+def is_email_configured():
+    """Check if email is properly configured."""
+    config = get_email_config()
+    return bool(config['smtp_username'] and config['smtp_password'] and config['from_email'])
+
+def send_email(to_email, subject, body_text, body_html=None):
+    """Send an email using configured SMTP settings."""
+    config = get_email_config()
+    if not is_email_configured():
+        return False, "Email not configured"
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{config['from_name']} <{config['from_email']}>"
+        msg['To'] = to_email
+        msg.attach(MIMEText(body_text, 'plain'))
+        if body_html:
+            msg.attach(MIMEText(body_html, 'html'))
+        with smtplib.SMTP(config['smtp_server'], config['smtp_port']) as server:
+            server.starttls()
+            server.login(config['smtp_username'], config['smtp_password'])
+            server.send_message(msg)
+        return True, "Sent"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Authentication failed"
+    except smtplib.SMTPException as e:
+        return False, f"SMTP error: {str(e)}"
+    except Exception as e:
+        return False, str(e)
+
+# =============================================================================
+# STUDENT & GUIDE DATA (for messaging)
+# =============================================================================
+
+STUDENTS = {
+    'Gus Castillo': {'email': 'gus.castillo@alpha.school', 'course': 'AP Human Geography'},
+    'Emma Cotner': {'email': 'emma.cotner@alpha.school', 'course': 'AP World History'},
+    'Jackson Price': {'email': 'jackson.price@alpha.school', 'course': 'AP World History'},
+    'Boris Dudarev': {'email': 'boris.dudarev@alpha.school', 'course': 'AP Human Geography'},
+    'Sydney Barba': {'email': 'sydney.barba@alpha.school', 'course': 'AP Human Geography'},
+    'Branson Pfiester': {'email': 'branson.pfiester@alpha.school', 'course': 'AP Human Geography'},
+    'Saeed Tarawneh': {'email': 'said.tarawneh@alpha.school', 'course': 'AP World History'},
+    'Aheli Shah': {'email': 'aheli.shah@alpha.school', 'course': 'AP Human Geography'},
+    'Ella Dietz': {'email': 'ella.dietz@alpha.school', 'course': 'AP World History'},
+    'Stella Cole': {'email': 'stella.cole@alpha.school', 'course': 'AP World History'},
+    'Erika Rigby': {'email': 'erika.rigby@alpha.school', 'course': 'AP Human Geography'},
+    'Grady Swanson': {'email': 'grady.swanson@alpha.school', 'course': 'AP Human Geography'},
+    'Zayen Szpitalak': {'email': 'zayen.szpitalak@alpha.school', 'course': 'AP Human Geography'},
+    'Adrienne Laswell': {'email': 'adrienne.laswell@alpha.school', 'course': 'AP Human Geography'},
+    'Austin Lin': {'email': 'austin.lin@alpha.school', 'course': 'AP Human Geography'},
+    'Jessica Owenby': {'email': 'jessica.owenby@alpha.school', 'course': 'AP Human Geography'},
+    'Cruce Saunders IV': {'email': 'cruce.saunders@alpha.school', 'course': 'AP US History'},
+    'Kavin Lingham': {'email': 'kavin.lingham@alpha.school', 'course': 'AP World History'},
+    'Stella Grams': {'email': 'stella.grams@alpha.school', 'course': 'AP World History'},
+    'Jacob Kuchinsky': {'email': 'jacob.kuchinsky@alpha.school', 'course': 'AP Human Geography'},
+    'Luca Sanchez': {'email': 'luca.sanchez@alpha.school', 'course': 'AP Human Geography'},
+    'Ali Romman': {'email': 'ali.romman@alpha.school', 'course': 'AP Human Geography'},
+    'Benny Valles': {'email': 'benjamin.valles@alpha.school', 'course': 'AP Human Geography'},
+    'Vera Li': {'email': 'vera.li@alpha.school', 'course': 'AP Human Geography'},
+    'Emily Smith': {'email': 'emily.smith@alpha.school', 'course': 'AP US Government'},
+    'Paty Margain-Junco': {'email': 'paty.margainjunco@alpha.school', 'course': 'AP US History'},
+    'Michael Cai': {'email': 'michael.cai@alpha.school', 'course': 'AP World History'},
+}
+
+GUIDES = {
+    'Gus Castillo': {'name': 'Jebin Justin', 'email': 'jebin.justin@alpha.school'},
+    'Austin Lin': {'name': 'Jebin Justin', 'email': 'jebin.justin@alpha.school'},
+    'Zayen Szpitalak': {'name': 'Jebin Justin', 'email': 'jebin.justin@alpha.school'},
+    'Cruce Saunders IV': {'name': 'Jebin Justin', 'email': 'jebin.justin@alpha.school'},
+    'Vera Li': {'name': 'Jebin Justin', 'email': 'jebin.justin@alpha.school'},
+    'Emma Cotner': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Aheli Shah': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Ella Dietz': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Erika Rigby': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Paty Margain-Junco': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Stella Cole': {'name': 'Chloe Belvin', 'email': 'chloe.belvin@alpha.school'},
+    'Branson Pfiester': {'name': 'Cameron Sorsby', 'email': 'cameron.sorsby@alpha.school'},
+    'Saeed Tarawneh': {'name': 'Cameron Sorsby', 'email': 'cameron.sorsby@alpha.school'},
+    'Grady Swanson': {'name': 'Cameron Sorsby', 'email': 'cameron.sorsby@alpha.school'},
+    'Jackson Price': {'name': 'Cameron Sorsby', 'email': 'cameron.sorsby@alpha.school'},
+    'Stella Grams': {'name': 'Cameron Sorsby', 'email': 'cameron.sorsby@alpha.school'},
+    'Boris Dudarev': {'name': 'Logan Higuera', 'email': 'logan.higuera@alpha.school'},
+    'Sydney Barba': {'name': 'Logan Higuera', 'email': 'logan.higuera@alpha.school'},
+    'Luca Sanchez': {'name': 'Logan Higuera', 'email': 'logan.higuera@alpha.school'},
+    'Adrienne Laswell': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Jessica Owenby': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Kavin Lingham': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Jacob Kuchinsky': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Ali Romman': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Benny Valles': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Emily Smith': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+    'Michael Cai': {'name': 'Emily Findley', 'email': 'emily.findley@alpha.school'},
+}
+
+# =============================================================================
+# COMMS HISTORY TRACKING
+# =============================================================================
+
+def load_comms_history():
+    """Load recommendation message history."""
+    if COMMS_HISTORY_FILE.exists():
+        with open(COMMS_HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_comms_history(history):
+    """Save recommendation message history."""
+    with open(COMMS_HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
+
+def record_comms_send(student_name, recommendation_type):
+    """Record that a recommendation message was sent to a student."""
+    history = load_comms_history()
+    if student_name not in history:
+        history[student_name] = {}
+    if recommendation_type not in history[student_name]:
+        history[student_name][recommendation_type] = []
+    history[student_name][recommendation_type].append(datetime.now().isoformat())
+    save_comms_history(history)
+
+
+# =============================================================================
+# RECOMMENDATION LOCK FUNCTIONS
+# =============================================================================
+
+def get_week_start(date):
+    """Return the Monday of the week containing the given date."""
+    # weekday() returns 0 for Monday, 6 for Sunday
+    days_since_monday = date.weekday()
+    return date - timedelta(days=days_since_monday)
+
+
+def is_weekend(date):
+    """Return True if date is Saturday (5) or Sunday (6)."""
+    return date.weekday() >= 5
+
+
+def load_recommendation_lock():
+    """Load the recommendation lock file."""
+    if RECOMMENDATION_LOCK_FILE.exists():
+        try:
+            with open(RECOMMENDATION_LOCK_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
+def save_recommendation_lock(students):
+    """
+    Save current recommendations and progress to lock file.
+    students: list of student dicts from build_unified_table
+    """
+    today = datetime.now().date()
+    lock_data = {
+        'locked_at': datetime.now().isoformat(),
+        'week_start': get_week_start(today).isoformat(),
+        'students': {}
+    }
+
+    for s in students:
+        key = f"{s['student']}|{s['course']}"
+        lock_data['students'][key] = {
+            'rec': s.get('recommendation', ''),
+            'detail': s.get('rec_detail', ''),
+            'combined_progress': s.get('combined_progress', 0),
+            'xp': s.get('current_xp', 0)
+        }
+
+    with open(RECOMMENDATION_LOCK_FILE, 'w') as f:
+        json.dump(lock_data, f, indent=2)
+
+    return lock_data
+
+
+def delete_recommendation_lock():
+    """Delete the lock file (unlock)."""
+    if RECOMMENDATION_LOCK_FILE.exists():
+        RECOMMENDATION_LOCK_FILE.unlink()
+
+
+def get_lock_state():
+    """
+    Determine current lock state.
+    Returns: dict with 'locked' (bool), 'lock_date' (str or None), 'reason' (str)
+    """
+    today = datetime.now().date()
+
+    # Weekend = always unlocked
+    if is_weekend(today):
+        return {
+            'locked': False,
+            'lock_date': None,
+            'reason': 'weekend'
+        }
+
+    lock_data = load_recommendation_lock()
+
+    # No lock file = unlocked
+    if lock_data is None:
+        return {
+            'locked': False,
+            'lock_date': None,
+            'reason': 'no_lock_file'
+        }
+
+    # Check if lock is from current week
+    try:
+        lock_week_start = datetime.fromisoformat(lock_data['week_start']).date()
+    except (KeyError, ValueError):
+        return {
+            'locked': False,
+            'lock_date': None,
+            'reason': 'invalid_lock_file'
+        }
+
+    current_week_start = get_week_start(today)
+
+    # Lock from previous week = stale, unlocked
+    if lock_week_start < current_week_start:
+        return {
+            'locked': False,
+            'lock_date': lock_data.get('locked_at'),
+            'reason': 'stale_lock'
+        }
+
+    # Valid lock from current week
+    return {
+        'locked': True,
+        'lock_date': lock_data.get('locked_at'),
+        'reason': 'active'
+    }
+
+
+def get_locked_data(student_name, course):
+    """
+    Get locked recommendation and progress for a student.
+    Returns: dict with 'rec', 'detail', 'combined_progress', 'xp' or None if not found.
+    """
+    lock_data = load_recommendation_lock()
+    if lock_data is None:
+        return None
+
+    key = f"{student_name}|{course}"
+    return lock_data.get('students', {}).get(key)
+
+def get_students_by_recommendation(students):
+    """Group students by their current recommendation, with history annotations."""
+    by_rec = {
+        'PT': [], 'Stay': [], 'FRQ': [], 'Hole-Fill': [],
+        'Hole+FRQ': [], 'Speed': [], 'Holes': [], 'Impossible': []
+    }
+    history = load_comms_history()
+
+    for s in students:
+        rec = s.get('recommendation', 'Unknown')
+        if rec in by_rec:
+            student_history = history.get(s['student'], {}).get(rec, [])
+            s['last_sent'] = student_history[-1] if student_history else None
+            s['is_new'] = len(student_history) == 0
+            by_rec[rec].append(s)
+
+    return by_rec
+
+# =============================================================================
+# OPENAI MESSAGE GENERATION
+# =============================================================================
+
+REC_PROMPTS = {
+    'PT': "Student has completed the course content. Encourage them to take a practice test to establish a baseline before the AP exam.",
+    'Stay': "Student is on track. Encourage them to maintain their current pace and keep up the good work.",
+    'FRQ': "Student's FRQ accuracy is notably lower than MCQ. Recommend focused FRQ practice with specific strategies.",
+    'Hole-Fill': "Student has content gaps in earlier units. Recommend revisiting specific units before moving forward.",
+    'Hole+FRQ': "Student has both content gaps AND FRQ weakness. Prioritize filling holes first, then FRQ practice.",
+    'Speed': "Student needs to increase their daily pace to meet the deadline. Be encouraging but honest about the effort needed.",
+    'Holes': "Late student with content gaps. Recommend targeted mini-courses to efficiently fill gaps.",
+    'Impossible': "Student cannot realistically complete the course in time. Be supportive, focus on maximizing what's achievable, celebrate effort."
+}
+
+def generate_recommendation_message(student, additional_context=''):
+    """Generate personalized message using OpenAI."""
+    if not OPENAI_AVAILABLE:
+        return None, "OpenAI not available (pip install openai)"
+
+    config = load_config()
+    api_key = config.get('openai_api_key') or os.environ.get('OPENAI_API_KEY', '')
+    if not api_key:
+        return None, "OpenAI API key not configured"
+
+    rec = student.get('recommendation', 'Stay')
+    rec_detail = student.get('rec_detail', '')
+    weak_units = student.get('weak_units', [])
+    rec_courses = student.get('rec_courses', [])
+
+    student_context = f"""
+Student: {student.get('student', 'Unknown')}
+Course: {student.get('course', 'Unknown')}
+Progress: {student.get('combined_progress', 'N/A')}%
+Daily XP Rate: {student.get('daily_xp', 'N/A')} XP/day
+XP to 90%: {student.get('xp_to_90', 'N/A')}
+Projected 90% Date: {student.get('projected_90', 'N/A')}
+Practice Test Score: {student.get('pt_score') or 'Not taken'}
+MCQ Accuracy: {student.get('mcq') or 'N/A'}%
+FRQ Accuracy: {student.get('frq') or 'N/A'}%
+Recommendation: {rec}
+Recommendation Detail: {rec_detail}
+Weak Units: {', '.join([u.get('unit_name', u.get('unit_id', '')) for u in weak_units]) if weak_units else 'None'}
+Recommended Courses: {', '.join([c.get('name', '') for c in rec_courses]) if rec_courses else 'None'}
+"""
+
+    # Add coach's additional context if provided
+    if additional_context:
+        student_context += f"\nAdditional context from coach (IMPORTANT - incorporate these specific details):\n{additional_context}\n"
+
+    system_prompt = """You are Coach Adam, an AP exam prep coach. Write a brief, encouraging
+Slack message to a student about their AP course progress. Be warm but direct.
+Keep the message under 200 words. Use the student's first name only.
+Include specific action items based on their situation.
+If additional context is provided by the coach, make sure to incorporate those specific details naturally into your message.
+End with encouragement. Don't use emojis excessively (one or two max)."""
+
+    user_prompt = f"""{student_context}
+
+Recommendation guidance: {REC_PROMPTS.get(rec, '')}
+
+Write a personalized message for this student."""
+
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        return response.choices[0].message.content, None
+    except Exception as e:
+        return None, str(e)
+
+# =============================================================================
+# MULTI-CHANNEL SEND
+# =============================================================================
+
+def send_recommendation_message(student, message_text):
+    """
+    Send recommendation message to all 4 channels:
+    1. Slack DM to student
+    2. Slack DM to coach (record keeping)
+    3. Email to student
+    4. Email to guide
+    """
+    results = {
+        'slack_student': {'success': False, 'message': 'Not attempted'},
+        'slack_coach': {'success': False, 'message': 'Not attempted'},
+        'email_student': {'success': False, 'message': 'Not attempted'},
+        'email_guide': {'success': False, 'message': 'Not attempted'}
+    }
+
+    student_name = student.get('student', '')
+    student_info = STUDENTS.get(student_name, {})
+    student_email = student_info.get('email', '')
+    # Fallback: generate email from name if not in STUDENTS dict
+    if not student_email and student_name:
+        student_email = student_name.lower().replace(' ', '.') + '@alpha.school'
+    guide_info = GUIDES.get(student_name, {})
+    guide_email = guide_info.get('email', '')
+    config = load_config()
+    coach_email = config.get('from_email', '')
+
+    # 1. Slack to student
+    if student_email:
+        success, msg = send_slack_dm(student_email, message_text)
+        results['slack_student'] = {'success': success, 'message': msg}
+
+    # 2. Slack to coach
+    if coach_email:
+        record_msg = f"[SENT TO {student_name}]\n\n{message_text}"
+        success, msg = send_slack_dm(coach_email, record_msg)
+        results['slack_coach'] = {'success': success, 'message': msg}
+
+    # 3. Email to student
+    if student_email:
+        course = student.get('course', 'AP Course')
+        subject = f"{course} - Quick Check-in"
+        html_body = '<br><br>'.join(f'<p>{p}</p>' for p in message_text.split('\n\n') if p.strip())
+        success, msg = send_email(student_email, subject, message_text, html_body)
+        results['email_student'] = {'success': success, 'message': msg}
+
+    # 4. Email to guide
+    if guide_email:
+        guide_name = guide_info.get('name', 'Guide')
+        guide_subject = f"[FYI] AP Coaching Message to {student_name}"
+        guide_body = f"Hi {guide_name},\n\nFor your awareness, I sent the following message to {student_name}:\n\n---\n\n{message_text}\n\n---\n\nBest,\nCoach Adam"
+        success, msg = send_email(guide_email, guide_subject, guide_body)
+        results['email_guide'] = {'success': success, 'message': msg}
+    else:
+        results['email_guide'] = {'success': False, 'message': 'No guide assigned'}
+
+    return results
 
 # =============================================================================
 # COURSE MAPPINGS
@@ -452,10 +939,54 @@ def calculate_unit_combined_progress(student_name, student_id, course, timeback_
     aw_unit_pct = {}
     if len(aw_mastery_raw) > 0:
         name_normalized = student_name.lower().strip()
+        name_parts = name_normalized.split()
+        # Also try without hyphens for matching
+        name_no_hyphen = name_normalized.replace('-', '')
+
+        # Try exact match first
         student_aw = aw_mastery_raw[
             (aw_mastery_raw['student_name'].str.lower().str.strip() == name_normalized) &
             (aw_mastery_raw['course'] == course)
         ]
+
+        # Try without hyphen (Margain-Junco → margainjunco)
+        if len(student_aw) == 0:
+            student_aw = aw_mastery_raw[
+                (aw_mastery_raw['student_name'].str.lower().str.strip().str.replace('-', '', regex=False) == name_no_hyphen) &
+                (aw_mastery_raw['course'] == course)
+            ]
+
+        # If no exact match, try fuzzy matching
+        if len(student_aw) == 0 and len(name_parts) >= 2:
+            first_name = name_parts[0]
+            last_name = name_parts[-1].replace('-', '')  # Remove hyphen from last name
+            course_data = aw_mastery_raw[aw_mastery_raw['course'] == course]
+
+            for aw_name in course_data['student_name'].unique():
+                aw_lower = aw_name.lower().strip()
+                aw_parts = aw_lower.replace('-', '').split()
+
+                if len(aw_parts) >= 2:
+                    aw_first = aw_parts[0]
+                    aw_last = aw_parts[-1]
+                    # Last name must match (ignoring hyphens), first name must share 3+ char prefix
+                    if aw_last == last_name and len(first_name) >= 3 and len(aw_first) >= 3:
+                        if aw_first.startswith(first_name[:3]) or first_name.startswith(aw_first[:3]):
+                            student_aw = aw_mastery_raw[
+                                (aw_mastery_raw['student_name'].str.lower().str.strip() == aw_lower) &
+                                (aw_mastery_raw['course'] == course)
+                            ]
+                            break
+                elif len(aw_parts) == 1:
+                    # Single name in AW (e.g., "Jeremy") - match if first name matches
+                    aw_single = aw_parts[0]
+                    if aw_single == first_name or (len(first_name) >= 3 and len(aw_single) >= 3 and
+                        (aw_single.startswith(first_name[:3]) or first_name.startswith(aw_single[:3]))):
+                        student_aw = aw_mastery_raw[
+                            (aw_mastery_raw['student_name'].str.lower().str.strip() == aw_lower) &
+                            (aw_mastery_raw['course'] == course)
+                        ]
+                        break
         for _, row in student_aw.iterrows():
             unit_id = str(row.get('unit_id', ''))
             mastery = row.get('unit_mastery_pct', 0)
@@ -473,21 +1004,26 @@ def calculate_unit_combined_progress(student_name, student_id, course, timeback_
 
     unit_details = []
     total_pct = 0
+    ced_unit_count = 0
     non_ced_for_course = NON_CED_UNITS.get(course, ['0'])
     for unit_num in sorted(content_units, key=int):
         tb_pct = tb_unit_pct.get(unit_num, 0)
         aw_pct = aw_unit_pct.get(unit_num, 0)
         combined = max(tb_pct, aw_pct)
-        total_pct += combined
+        is_non_ced = unit_num in non_ced_for_course
+        # Only count CED units toward progress (exclude U0 and other non-CED)
+        if not is_non_ced:
+            total_pct += combined
+            ced_unit_count += 1
         unit_details.append({
             'unit': unit_num,
             'timeback': round(tb_pct, 1),
             'austin_way': round(aw_pct, 1),
             'combined': round(combined, 1),
-            'non_ced': unit_num in non_ced_for_course
+            'non_ced': is_non_ced
         })
 
-    combined_progress = total_pct / len(content_units) if content_units else 0
+    combined_progress = total_pct / ced_unit_count if ced_unit_count > 0 else 0
 
     return {
         'combined_progress': round(combined_progress, 1),
@@ -549,9 +1085,76 @@ def calculate_test_performance(student_id, course, timeback_data):
     return result
 
 
-def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late_for_pt, aw_mastery_raw, test_perf=None, unit_details=None):
+def get_frq_practice_detail(frq_accuracy, mcq_accuracy, course):
+    """
+    Generate specific FRQ practice recommendations based on student level.
+
+    Time budget: Max 75 minutes FRQ practice daily
+    Higher performers (70%+) get lighter load (30-45 min) to avoid burnout
+    FRQ types and times:
+    - SAQ (Short Answer): 10-15 min each
+    - LEQ (Long Essay): 35-45 min
+    - DBQ (Document Based): 45-60 min
+    """
+    frq = frq_accuracy or 0
+
+    # Course-specific FRQ types
+    if course in ['APUSH', 'APWH']:
+        # These have SAQ, LEQ, and DBQ
+        if frq < 40:
+            # Foundation building - focus on SAQs
+            return "Start with SAQs: do 4-5 SAQs daily (60 min), focus on using specific evidence"
+        elif frq < 55:
+            # Building up - mix SAQs with one essay
+            return "Do 2 SAQs + 1 LEQ daily (75 min). Practice thesis statements and evidence organization"
+        elif frq < 70:
+            # Getting stronger - essay practice
+            return "Do 1 DBQ OR 1 LEQ + 2 SAQs daily (75 min). Work on document analysis and argument structure"
+        else:
+            # Polish mode - lighter load, quality over quantity
+            return "Do 1 LEQ or 1 DBQ daily (45 min). Focus on refining thesis and evidence quality"
+
+    elif course == 'APGOV':
+        # APGOV has 4 FRQs: Concept Application, Quantitative Analysis, SCOTUS Comparison, Argument Essay
+        if frq < 40:
+            return "Do 3 Concept Application FRQs daily (60 min). Build foundational political analysis"
+        elif frq < 55:
+            return "Do 2 Concept Apps + 1 Quantitative FRQ daily (75 min). Practice data interpretation"
+        elif frq < 70:
+            return "Do 3 mixed FRQ types daily (75 min). Focus on SCOTUS comparisons"
+        else:
+            return "Do 2 FRQs daily (30 min). Polish Argument Essay thesis and maintain skills"
+
+    elif course == 'APHG':
+        # APHG has 3 FRQs, no DBQ/LEQ
+        if frq < 40:
+            return "Do 3 FRQs daily (60 min). Focus on defining geographic concepts with examples"
+        elif frq < 55:
+            return "Do 4 FRQs daily (75 min). Practice connecting concepts to real-world cases"
+        elif frq < 70:
+            return "Do 4-5 FRQs daily (75 min). Work on multi-part question organization"
+        else:
+            return "Do 2-3 FRQs daily (30-45 min). Maintain skills with quality practice"
+
+    # Generic fallback
+    if frq < 40:
+        return "Do 3-4 short FRQs daily (60 min). Build foundation with practice and review"
+    elif frq < 55:
+        return "Do 4-5 FRQs daily (75 min). Focus on complete answers with evidence"
+    elif frq < 70:
+        return "Do 4-5 FRQs daily (75 min). Practice essay structure and time management"
+    else:
+        return "Do 2-3 FRQs daily (30-45 min). Maintain skills with quality over quantity"
+
+
+def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late_for_pt, aw_mastery_raw, test_perf=None, unit_details=None, pt_score=None):
     """
     Calculate recommendation for students:
+
+    For students with PT score of 5:
+    - Stay: Keep doing what they're doing
+    - FRQ: If FRQ accuracy is weak
+    - Speed: If they need to pick up pace
 
     For LATE students:
     - Speed: Just need to work harder (required <= 2x current, and achievable)
@@ -572,6 +1175,51 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
     if unit_details is None:
         unit_details = []
 
+    # === STUDENTS WITH PT SCORE OF 5 ===
+    # They're already excelling - only recommend Stay, FRQ practice, or Speed
+    if pt_score == 5:
+        has_frq_weakness = test_perf.get('frq_weak', False)
+        mcq = test_perf.get('mcq_accuracy', 0) or 0
+        frq = test_perf.get('frq_accuracy', 0) or 0
+
+        # Check if they need to speed up (late for PT deadline)
+        if late_for_pt:
+            today = datetime.now().date()
+            days_remaining = count_school_days(today, PT_DEADLINE)
+            required_xp_per_day = max(xp_to_90 / days_remaining, MIN_RECOMMENDED_XP_PER_DAY) if days_remaining > 0 else 999
+            return {
+                'rec': 'Speed',
+                'detail': f'PT score 5 - maintain pace ({int(required_xp_per_day)} XP/day needed)',
+                'required_xp_day': int(required_xp_per_day),
+                'days_remaining': days_remaining,
+                'weak_units': [],
+                'courses': [],
+                'frontier': 0,
+                'incomplete': []
+            }
+
+        # Check for FRQ weakness
+        if has_frq_weakness:
+            frq_detail = get_frq_practice_detail(frq, mcq, course)
+            return {
+                'rec': 'FRQ',
+                'detail': f'PT score 5 - FRQ ({frq:.0f}%) vs MCQ ({mcq:.0f}%). {frq_detail}',
+                'weak_units': [],
+                'courses': [],
+                'frontier': 0,
+                'incomplete': []
+            }
+
+        # Otherwise, stay the course
+        return {
+            'rec': 'Stay',
+            'detail': 'PT score 5 - stay the course, you\'re doing great!',
+            'weak_units': [],
+            'courses': [],
+            'frontier': 0,
+            'incomplete': []
+        }
+
     # Build unit name lookup from Austin Way data
     unit_names = {}
     if len(aw_mastery_raw) > 0:
@@ -584,13 +1232,17 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
             unit_id = str(row.get('unit_id', ''))
             unit_names[unit_id] = row.get('unit_name', f'Unit {unit_id}')
 
-    # Find the "frontier" - highest unit where student has done meaningful work (>20% combined)
+    # Find the "frontier" - highest CED unit where student has done meaningful work (>20% combined)
     # Units BEFORE frontier with <60% are "holes"
     # Units AT or AFTER frontier with <60% are just "incomplete"
+    # Skip non-CED units (U0, etc.) - they don't affect frontier
     frontier = 0
     for ud in unit_details:
         unit_num = ud.get('unit', '')
         combined = ud.get('combined', 0)
+        non_ced = ud.get('non_ced', False)
+        if non_ced:
+            continue
         try:
             unit_int = int(unit_num)
             if combined > 20 and unit_int > frontier:
@@ -599,11 +1251,18 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
             pass
 
     # Identify holes (weak units BEFORE frontier) vs incomplete (at/after frontier)
+    # SKIP non-CED units (U0, etc.) - they don't count for completion or holes
     holes = []
     incomplete = []
     for ud in unit_details:
         unit_num = ud.get('unit', '')
         combined = ud.get('combined', 0)
+        non_ced = ud.get('non_ced', False)
+
+        # Skip non-CED units entirely - they don't count for holes or completion
+        if non_ced:
+            continue
+
         try:
             unit_int = int(unit_num)
         except (ValueError, TypeError):
@@ -611,12 +1270,11 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
 
         if combined < 60:
             unit_id = f'u{unit_num}'
-            non_ced = ud.get('non_ced', False)
             unit_info = {
                 'unit_id': unit_id,
                 'unit_name': unit_names.get(unit_id, f'Unit {unit_num}'),
                 'mastery': int(combined),
-                'non_ced': non_ced
+                'non_ced': False  # By definition, we've filtered out non-CED
             }
             if unit_int < frontier:
                 holes.append(unit_info)
@@ -641,12 +1299,32 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
         mcq = test_perf.get('mcq_accuracy', 0) or 0
         frq = test_perf.get('frq_accuracy', 0) or 0
 
+        # FIRST: Check if course is complete - they need PT before anything else
+        # Last content units: APHG=7, APGOV=5, APUSH=9, APWH=9
+        last_content_unit = {'APHG': 7, 'APGOV': 5, 'APUSH': 9, 'APWH': 9}.get(course, 9)
+        course_complete = (
+            len(incomplete) == 0 or
+            xp_to_90 <= 0 or
+            frontier >= last_content_unit
+        )
+        if course_complete:
+            return {
+                'rec': 'PT',
+                'detail': 'Course complete — take practice test for new baseline',
+                'weak_units': [],
+                'courses': [],
+                'frontier': frontier,
+                'incomplete': incomplete
+            }
+
+        # NOT complete yet - check for holes and FRQ issues
         # Both holes AND FRQ weakness
         if has_holes and has_frq_weakness:
             hole_units = ', '.join([h['unit_id'].replace('u', '') for h in holes])
+            frq_detail = get_frq_practice_detail(frq, mcq, course)
             return {
                 'rec': 'Hole+FRQ',
-                'detail': f'Hole in unit(s) {hole_units} (before frontier {frontier}), then FRQ practice',
+                'detail': f'Holes in unit(s) {hole_units} — fix first, then FRQ: {frq_detail}',
                 'weak_units': holes,
                 'courses': recommended_courses,
                 'frontier': frontier,
@@ -663,29 +1341,12 @@ def calculate_recommendation(student_name, course, xp_to_90, daily_xp_rate, late
                 'frontier': frontier,
                 'incomplete': incomplete
             }
-        # Just FRQ weakness
+        # Just FRQ weakness (but not complete)
         if has_frq_weakness:
+            frq_detail = get_frq_practice_detail(frq, mcq, course)
             return {
                 'rec': 'FRQ',
-                'detail': f'FRQ accuracy ({frq:.0f}%) trails MCQ ({mcq:.0f}%) — intensive FRQ practice recommended',
-                'weak_units': [],
-                'courses': [],
-                'frontier': frontier,
-                'incomplete': incomplete
-            }
-        # Course complete - needs practice test for new baseline
-        # Check if student has finished (frontier at last content unit, no incomplete, or already at 90%)
-        # Last content units: APHG=7, APGOV=5, APUSH=9, APWH=9
-        last_content_unit = {'APHG': 7, 'APGOV': 5, 'APUSH': 9, 'APWH': 9}.get(course, 9)
-        course_complete = (
-            len(incomplete) == 0 or
-            xp_to_90 <= 0 or
-            frontier >= last_content_unit
-        )
-        if course_complete:
-            return {
-                'rec': 'PT',
-                'detail': 'Course complete — take practice test for new baseline',
+                'detail': f'FRQ ({frq:.0f}%) vs MCQ ({mcq:.0f}%). {frq_detail}',
                 'weak_units': [],
                 'courses': [],
                 'frontier': frontier,
@@ -888,8 +1549,10 @@ def build_unified_table(data):
         unit_progress_data = calculate_unit_combined_progress(
             student_name, student_id, course, timeback, aw_mastery_raw
         )
-        combined_progress = unit_progress_data['combined_progress']
+        unit_based_combined = unit_progress_data['combined_progress']
         unit_details = unit_progress_data['unit_details']
+
+        combined_progress = unit_based_combined
 
         # Calculate XP to 90% using COMBINED progress
         # Note: PT 4+ students still see actual progress (may have holes to address)
@@ -945,7 +1608,7 @@ def build_unified_table(data):
 
         # Calculate recommendation first (needed for risk assessment)
         rec_data = calculate_recommendation(
-            student_name, course, xp_to_90, daily_xp_rate, late_for_pt, aw_mastery_raw, test_perf, unit_details
+            student_name, course, xp_to_90, daily_xp_rate, late_for_pt, aw_mastery_raw, test_perf, unit_details, pt_score
         )
 
         # Risk assessment - factors in both knowledge AND deadline
@@ -980,12 +1643,17 @@ def build_unified_table(data):
                 if risk in ('On Track', 'Strong', 'Unknown'):
                     risk = 'At Risk'
 
+        # Calculate TB-only progress from unit data (consistent with combined calculation)
+        ced_units = [ud for ud in unit_details if not ud.get('non_ced', False)]
+        tb_from_units = sum(ud['timeback'] for ud in ced_units) / len(ced_units) if ced_units else 0
+        aw_from_units = sum(ud['austin_way'] for ud in ced_units) / len(ced_units) if ced_units else 0
+
         rows.append({
             'student': student_name,
             'student_id': student_id,
             'course': course,
-            'timeback_progress': round(progress, 1) if pd.notna(progress) else None,
-            'aw_mastery': int(aw_mastery_pct) if aw_mastery_pct is not None else None,
+            'timeback_progress': round(tb_from_units, 1),
+            'aw_mastery': round(aw_from_units, 1) if aw_from_units > 0 else (int(aw_mastery_pct) if aw_mastery_pct is not None else None),
             'combined_progress': round(combined_progress, 1),
             'unit_details': unit_details,
             'mcq': round(mcq, 1) if pd.notna(mcq) else None,
@@ -1017,6 +1685,18 @@ def build_unified_table(data):
             'tb_frq_accuracy': test_perf.get('frq_accuracy'),
             'frq_weak': test_perf.get('frq_weak', False),
         })
+
+        # Add locked recommendation and progress delta
+        locked_data = get_locked_data(student_name, course)
+        if locked_data:
+            rows[-1]['locked_recommendation'] = locked_data.get('rec')
+            rows[-1]['locked_rec_detail'] = locked_data.get('detail')
+            locked_progress = locked_data.get('combined_progress', 0)
+            rows[-1]['progress_vs_last_week'] = round(combined_progress - locked_progress, 1)
+        else:
+            rows[-1]['locked_recommendation'] = None
+            rows[-1]['locked_rec_detail'] = None
+            rows[-1]['progress_vs_last_week'] = None
 
     return rows
 
@@ -1517,7 +2197,7 @@ DASHBOARD_HTML = '''
         .rec-pt { color: #44dddd; }
         .rec-hole-fill { color: #ff8844; }
         .rec-frq { color: #aa88ff; }
-        .rec-hole\+frq { color: #ff88ff; font-weight: bold; }
+        .rec-hole-frq { color: #ff88ff; font-weight: bold; }
         .rec-speed { color: #ffaa00; font-weight: bold; }
         .rec-holes { color: #ff8844; font-weight: bold; }
         .rec-impossible { color: #ff4444; font-weight: bold; }
@@ -1574,8 +2254,10 @@ DASHBOARD_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
-        <a href="/coaching">Coaching Calls</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
+        <a href="/settings">Settings</a>
     </nav>
 
     <div class="summary-cards">
@@ -1616,12 +2298,31 @@ DASHBOARD_HTML = '''
             <option value="On Track">On Track</option>
             <option value="Strong">Strong</option>
         </select>
+        <select id="filter-rec">
+            <option value="">All Recommendations</option>
+            <option value="PT">PT</option>
+            <option value="Stay">Stay</option>
+            <option value="FRQ">FRQ</option>
+            <option value="Hole-Fill">Hole-Fill</option>
+            <option value="Hole+FRQ">Hole+FRQ</option>
+            <option value="Speed">Speed</option>
+            <option value="Holes">Holes</option>
+            <option value="Impossible">Impossible</option>
+        </select>
         <select id="filter-late">
             <option value="">All Students</option>
             <option value="true">Late for Apr 16</option>
             <option value="false">On Track for Apr 16</option>
         </select>
         <input type="text" id="filter-search" placeholder="Search student...">
+        <button onclick="exportCSV()" style="padding: 8px 16px; background: #4da6ff; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Export CSV</button>
+    </div>
+
+    <div id="lock-status" style="display: flex; align-items: center; gap: 15px; margin-bottom: 15px; padding: 10px 15px; background: #1a1a2e; border-radius: 6px;">
+        <span id="lock-indicator" style="font-size: 14px;"></span>
+        <button id="lock-btn" onclick="lockRecommendations()" style="padding: 6px 12px; background: #4da6ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; display: none;">Lock Recommendations</button>
+        <button id="unlock-btn" onclick="unlockRecommendations()" style="padding: 6px 12px; background: #ff8844; color: #fff; border: none; border-radius: 4px; cursor: pointer; display: none;">Unlock</button>
+        <span id="lock-warning" style="color: #ff8844; font-size: 12px; display: none;"></span>
     </div>
 
     <table id="student-table">
@@ -1634,15 +2335,17 @@ DASHBOARD_HTML = '''
                 <th data-sort="timeback_progress">Timeback</th>
                 <th data-sort="aw_mastery">Austin Way</th>
                 <th data-sort="combined_progress">Combined</th>
+                <th data-sort="progress_vs_last_week">vs Last Wk</th>
                 <th data-sort="xp_to_90">XP to 90%</th>
                 <th data-sort="projected_90">Proj 90%</th>
-                <th data-sort="recommendation">Rec</th>
+                <th data-sort="locked_recommendation" class="locked-col">Rec (Locked)</th>
+                <th data-sort="recommendation">Rec (Live)</th>
                 <th data-sort="daily_xp">XP/SchoolDay</th>
             </tr>
         </thead>
         <tbody>
             {% for s in students %}
-            <tr data-course="{{ s.course }}" data-risk="{{ s.risk }}" data-late="{{ 'true' if s.late_for_pt else 'false' }}" data-student="{{ s.student }}" onclick="window.location='/student/{{ s.student|urlencode }}/{{ s.course }}'">
+            <tr data-course="{{ s.course }}" data-risk="{{ s.risk }}" data-rec="{{ s.recommendation }}" data-late="{{ 'true' if s.late_for_pt else 'false' }}" data-student="{{ s.student }}" onclick="window.location='/student/{{ s.student|urlencode }}/{{ s.course }}'">
                 <td>{{ s.student }}</td>
                 <td><span class="course-tag course-{{ s.course }}">{{ s.course }}</span></td>
                 <td class="risk-{{ s.risk|replace(' ', '-') }}">{{ s.risk }}</td>
@@ -1662,6 +2365,13 @@ DASHBOARD_HTML = '''
                 <td class="metric {% if s.combined_progress and s.combined_progress >= 90 %}metric-good{% elif s.combined_progress and s.combined_progress >= 70 %}metric-ok{% elif s.combined_progress %}metric-bad{% else %}metric-null{% endif %}">
                     {{ s.combined_progress|default('—', true) }}{% if s.combined_progress %}%{% endif %}
                 </td>
+                <td class="{% if s.progress_vs_last_week and s.progress_vs_last_week > 0 %}metric-good{% elif s.progress_vs_last_week == 0 %}metric-null{% elif s.progress_vs_last_week %}metric-bad{% else %}metric-null{% endif %}">
+                    {% if s.progress_vs_last_week is not none %}
+                    {{ '+' if s.progress_vs_last_week > 0 else '' }}{{ s.progress_vs_last_week }}%
+                    {% else %}
+                    —
+                    {% endif %}
+                </td>
                 <td class="metric">
                     {% if s.xp_to_90 == 0 %}
                     <span class="metric-good">Done</span>
@@ -1674,8 +2384,15 @@ DASHBOARD_HTML = '''
                 <td class="{% if s.projected_90 == 'Done' %}projection-done{% elif s.late_for_pt %}projection-bad{% else %}projection-ok{% endif %}">
                     {{ s.projected_90|default('—', true) }}
                 </td>
+                <td class="locked-col rec-{{ s.locked_recommendation|lower|default('none', true) }}">
+                    {% if s.locked_recommendation %}
+                    {{ s.locked_recommendation }}
+                    {% else %}
+                    —
+                    {% endif %}
+                </td>
                 <td class="rec-{{ s.recommendation|lower }}">
-                    {{ s.recommendation }}
+                    {{ s.recommendation }}{% if s.locked_recommendation and s.locked_recommendation != s.recommendation %} <span style="color: #ff8844;" title="Changed from {{ s.locked_recommendation }}">⚠</span>{% endif %}
                 </td>
                 <td class="{% if s.daily_xp >= 50 %}activity-hot{% elif s.daily_xp >= 20 %}activity-warm{% elif s.daily_xp > 0 %}activity-cold{% else %}metric-null{% endif %}">
                     {{ s.daily_xp if s.daily_xp else '—' }}
@@ -1745,28 +2462,150 @@ DASHBOARD_HTML = '''
         function applyFilters() {
             const courseFilter = document.getElementById('filter-course').value;
             const riskFilter = document.getElementById('filter-risk').value;
+            const recFilter = document.getElementById('filter-rec').value;
             const lateFilter = document.getElementById('filter-late').value;
             const searchFilter = document.getElementById('filter-search').value.toLowerCase();
 
             document.querySelectorAll('#student-table tbody tr').forEach(row => {
                 const course = row.dataset.course;
                 const risk = row.dataset.risk;
+                const rec = row.dataset.rec;
                 const late = row.dataset.late;
                 const name = row.children[0].textContent.toLowerCase();
 
                 const matchCourse = !courseFilter || course === courseFilter;
                 const matchRisk = !riskFilter || risk === riskFilter;
+                const matchRec = !recFilter || rec === recFilter;
                 const matchLate = !lateFilter || late === lateFilter;
                 const matchSearch = !searchFilter || name.includes(searchFilter);
 
-                row.style.display = (matchCourse && matchRisk && matchLate && matchSearch) ? '' : 'none';
+                row.style.display = (matchCourse && matchRisk && matchRec && matchLate && matchSearch) ? '' : 'none';
             });
         }
 
         document.getElementById('filter-course').addEventListener('change', applyFilters);
         document.getElementById('filter-risk').addEventListener('change', applyFilters);
+        document.getElementById('filter-rec').addEventListener('change', applyFilters);
         document.getElementById('filter-late').addEventListener('change', applyFilters);
         document.getElementById('filter-search').addEventListener('input', applyFilters);
+
+        // Export visible rows to CSV
+        function exportCSV() {
+            const table = document.getElementById('student-table');
+            const headers = [];
+            const headerCells = table.querySelectorAll('thead th');
+            headerCells.forEach(th => headers.push(th.textContent.trim()));
+
+            const rows = [];
+            rows.push(headers.join(','));
+
+            table.querySelectorAll('tbody tr').forEach(row => {
+                if (row.style.display === 'none') return; // Skip filtered out rows
+
+                const cells = [];
+                row.querySelectorAll('td').forEach(td => {
+                    let text = td.textContent.trim().replace(/,/g, ';').replace(/\\n/g, ' ');
+                    // Wrap in quotes if contains special chars
+                    if (text.includes(';') || text.includes('"')) {
+                        text = '"' + text.replace(/"/g, '""') + '"';
+                    }
+                    cells.push(text);
+                });
+                rows.push(cells.join(','));
+            });
+
+            const csv = rows.join('\\n');
+            const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'ap_dashboard_export_' + new Date().toISOString().split('T')[0] + '.csv');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        // Lock status management
+        let lockState = { locked: false, lock_date: null, reason: '' };
+
+        async function updateLockStatus() {
+            try {
+                const resp = await fetch('/api/lock-status');
+                lockState = await resp.json();
+                renderLockStatus();
+            } catch (e) {
+                console.error('Failed to get lock status:', e);
+            }
+        }
+
+        function renderLockStatus() {
+            const indicator = document.getElementById('lock-indicator');
+            const lockBtn = document.getElementById('lock-btn');
+            const unlockBtn = document.getElementById('unlock-btn');
+            const warning = document.getElementById('lock-warning');
+            const lockedCols = document.querySelectorAll('.locked-col');
+
+            if (lockState.locked) {
+                const lockDate = lockState.lock_date ? new Date(lockState.lock_date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) : '';
+                indicator.innerHTML = `<span style="color: #4da6ff;">🔒 Locked (${lockDate})</span>`;
+                lockBtn.style.display = 'none';
+                unlockBtn.style.display = 'inline-block';
+                warning.style.display = 'none';
+                lockedCols.forEach(col => col.style.display = '');
+            } else {
+                indicator.innerHTML = '<span style="color: #888;">🔓 Unlocked</span>';
+                lockBtn.style.display = 'inline-block';
+                unlockBtn.style.display = 'none';
+
+                if (lockState.reason === 'weekend') {
+                    warning.textContent = 'Weekend mode - recommendations can change freely';
+                    warning.style.display = 'inline';
+                } else if (lockState.reason === 'stale_lock') {
+                    warning.textContent = 'Previous week\\'s lock expired - refresh data and re-lock';
+                    warning.style.display = 'inline';
+                } else {
+                    warning.style.display = 'none';
+                }
+
+                // Hide locked column when unlocked (optional - could show for comparison)
+                // lockedCols.forEach(col => col.style.display = 'none');
+            }
+        }
+
+        async function lockRecommendations() {
+            if (!confirm('Lock recommendations for this week? They will not change until next Monday.')) {
+                return;
+            }
+            try {
+                const resp = await fetch('/api/lock', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    alert(`Locked ${data.student_count} student recommendations.`);
+                    location.reload();
+                }
+            } catch (e) {
+                alert('Failed to lock: ' + e.message);
+            }
+        }
+
+        async function unlockRecommendations() {
+            if (!confirm('Unlock recommendations? Live values will be shown.')) {
+                return;
+            }
+            try {
+                const resp = await fetch('/api/unlock', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    location.reload();
+                }
+            } catch (e) {
+                alert('Failed to unlock: ' + e.message);
+            }
+        }
+
+        // Initialize lock status on page load
+        updateLockStatus();
     </script>
 </body>
 </html>
@@ -1888,7 +2727,10 @@ STUDENT_HTML = '''
 </head>
 <body>
     <nav class="nav">
-        <a href="/">← Back to Dashboard</a>
+        <a href="/">Dashboard</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/settings">Settings</a>
     </nav>
 
     <h1>{{ student.student }} <span class="course-tag course-{{ student.course }}">{{ student.course }}</span></h1>
@@ -2115,7 +2957,9 @@ COACHING_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
-        <a href="/coaching">Coaching Calls</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/settings">Settings</a>
     </nav>
 
     <p>Coaching call functionality moved here. <a href="http://localhost:5000">Open original dashboard</a> for full features.</p>
@@ -2185,6 +3029,33 @@ def api_student_timeseries(student_name, course):
     return jsonify(timeseries)
 
 
+@app.route('/api/lock-status')
+def api_lock_status():
+    """Get current lock state."""
+    state = get_lock_state()
+    return jsonify(state)
+
+
+@app.route('/api/lock', methods=['POST'])
+def api_lock():
+    """Lock current recommendations."""
+    data = load_all_data()
+    students = build_unified_table(data)
+    lock_data = save_recommendation_lock(students)
+    return jsonify({
+        'success': True,
+        'locked_at': lock_data['locked_at'],
+        'student_count': len(lock_data['students'])
+    })
+
+
+@app.route('/api/unlock', methods=['POST'])
+def api_unlock():
+    """Unlock recommendations (delete lock file)."""
+    delete_recommendation_lock()
+    return jsonify({'success': True})
+
+
 REFRESH_HTML = '''
 <!DOCTYPE html>
 <html>
@@ -2235,7 +3106,10 @@ REFRESH_HTML = '''
 </head>
 <body>
     <nav class="nav">
-        <a href="/">← Back to Dashboard</a>
+        <a href="/">Dashboard</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/settings">Settings</a>
     </nav>
 
     <h1>Data Refresh</h1>
@@ -2532,9 +3406,1010 @@ def harvest_cookie_route():
     return render_template_string(harvest_html, result=result)
 
 
+# =============================================================================
+# COMMUNICATIONS PAGE
+# =============================================================================
+
+COMMS_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Communications - AP Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 10px; color: #fff; }
+        .subtitle { color: #888; margin-bottom: 20px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { color: #4da6ff; margin-right: 20px; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+
+        .rec-section {
+            background: #252540;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            overflow: hidden;
+        }
+        .rec-header {
+            padding: 15px 20px;
+            background: #353560;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+        .rec-header:hover { background: #404070; }
+        .rec-title {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .rec-count {
+            background: #4da6ff;
+            color: #fff;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .rec-actions { display: flex; gap: 10px; }
+        .rec-body { padding: 0; display: none; }
+        .rec-body.open { display: block; }
+
+        .student-row {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            border-top: 1px solid #333;
+        }
+        .student-row:hover { background: #303050; }
+        .student-info { flex: 1; }
+        .student-name { font-weight: bold; }
+        .student-meta { font-size: 12px; color: #888; margin-top: 2px; }
+        .student-course {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            margin-left: 8px;
+        }
+        .course-APHG { background: #2d5a27; }
+        .course-APWH { background: #5a2727; }
+        .course-APUSH { background: #27415a; }
+        .course-APGOV { background: #5a4a27; }
+
+        .new-badge {
+            background: #ff8844;
+            color: #fff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            margin-left: 8px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            text-decoration: none;
+        }
+        .btn-primary { background: #4da6ff; color: #fff; }
+        .btn-primary:hover { background: #3d8cd9; }
+        .btn-secondary { background: #6b7280; color: #fff; }
+        .btn-secondary:hover { background: #5b6270; }
+        .btn-sm { padding: 4px 12px; font-size: 12px; }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.open { display: flex; }
+        .modal-content {
+            background: #252540;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 700px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            padding: 15px 20px;
+            background: #353560;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-body { padding: 20px; }
+        .modal-footer {
+            padding: 15px 20px;
+            background: #1a1a2e;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 24px;
+            cursor: pointer;
+        }
+        .close-btn:hover { color: #fff; }
+
+        textarea {
+            width: 100%;
+            min-height: 200px;
+            padding: 12px;
+            border: 1px solid #444;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+        }
+
+        .student-data {
+            background: #1a1a2e;
+            padding: 12px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            font-size: 12px;
+        }
+        .student-data dt { color: #888; display: inline; }
+        .student-data dd { display: inline; margin-right: 15px; }
+
+        .send-results {
+            margin-top: 15px;
+            padding: 12px;
+            background: #1a1a2e;
+            border-radius: 4px;
+        }
+        .result-success { color: #44ff44; }
+        .result-fail { color: #ff4444; }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: #888;
+        }
+
+        .config-warning {
+            background: #5a4a27;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .config-warning a { color: #4da6ff; }
+    </style>
+</head>
+<body>
+    <h1>Communications Center</h1>
+    <p class="subtitle">Send recommendation-based messages to students</p>
+
+    <nav class="nav">
+        <a href="/">Dashboard</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/refresh">Refresh Data</a>
+        <a href="/settings">Settings</a>
+    </nav>
+
+    {% if not openai_configured %}
+    <div class="config-warning">
+        <strong>OpenAI not configured.</strong> Add your API key in <a href="/settings">Settings</a> to enable AI-generated messages.
+    </div>
+    {% endif %}
+
+    {% for rec_type, students in by_recommendation.items() %}
+    <div class="rec-section">
+        <div class="rec-header" onclick="toggleSection(this)">
+            <div>
+                <span class="rec-title">{{ rec_type }}</span>
+                <span class="rec-count">{{ students|length }}</span>
+            </div>
+            <div class="rec-actions">
+                {% if students %}
+                <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); sendBulk('{{ rec_type }}', 'new')">Send New Only</button>
+                <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); sendBulk('{{ rec_type }}', 'all')">Send All</button>
+                {% endif %}
+            </div>
+        </div>
+        <div class="rec-body">
+            {% for s in students %}
+            <div class="student-row" data-student="{{ s.student }}" data-course="{{ s.course }}" data-rec="{{ rec_type }}" data-new="{{ 'true' if s.is_new else 'false' }}">
+                <div class="student-info">
+                    <span class="student-name">{{ s.student }}</span>
+                    <span class="student-course course-{{ s.course }}">{{ s.course }}</span>
+                    {% if s.is_new %}<span class="new-badge">NEW</span>{% endif %}
+                    <div class="student-meta">
+                        XP/day: {{ s.daily_xp|round(1) if s.daily_xp else 'N/A' }} |
+                        Progress: {{ s.combined_progress|round(0)|int if s.combined_progress else 'N/A' }}% |
+                        {% if s.last_sent %}Last sent: {{ s.last_sent[:10] }}{% else %}Never sent{% endif %}
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-sm" onclick="openPreview('{{ s.student }}', '{{ s.course }}')">Preview & Send</button>
+            </div>
+            {% else %}
+            <div class="student-row" style="color: #666;">No students with this recommendation</div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+
+    <!-- Bulk Send Modal -->
+    <div class="modal" id="bulk-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="bulk-modal-title">Bulk Send</span>
+                <button class="close-btn" onclick="closeBulkModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Phase 1: Context input -->
+                <div id="bulk-context-section">
+                    <p style="margin-bottom: 15px; color: #ccc;">
+                        Sending <strong id="bulk-rec-type"></strong> message to <strong id="bulk-count"></strong> student(s):
+                    </p>
+                    <div id="bulk-student-list" style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 15px; max-height: 100px; overflow-y: auto; font-size: 12px; color: #888;"></div>
+
+                    <label style="display: block; margin-bottom: 8px; color: #aaa;">
+                        Additional context for AI (applies to ALL messages):
+                    </label>
+                    <textarea id="bulk-context-text" placeholder="e.g., Your practice test will be this Friday. Mini-courses will be assigned tomorrow." style="min-height: 80px; margin-bottom: 15px;"></textarea>
+                    <button class="btn btn-primary" onclick="startBulkGeneration()">Generate All Messages</button>
+                </div>
+
+                <!-- Phase 2: Generation progress -->
+                <div id="bulk-progress-section" style="display: none;">
+                    <p style="margin-bottom: 10px; color: #ccc;">Generating messages...</p>
+                    <div id="bulk-progress-bar" style="background: #333; border-radius: 4px; height: 20px; overflow: hidden; margin-bottom: 15px;">
+                        <div id="bulk-progress-fill" style="background: #4da6ff; height: 100%; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="bulk-progress-text" style="color: #888; font-size: 12px;">0 / 0</div>
+                </div>
+
+                <!-- Phase 3: Review before send -->
+                <div id="bulk-review-section" style="display: none;">
+                    <p style="margin-bottom: 15px; color: #ccc;">Messages generated. Review and send:</p>
+                    <div id="bulk-messages-list" style="max-height: 500px; overflow-y: auto;"></div>
+                </div>
+
+                <!-- Phase 4: Send progress -->
+                <div id="bulk-send-section" style="display: none;">
+                    <p style="margin-bottom: 10px; color: #ccc;">Sending messages...</p>
+                    <div id="bulk-send-bar" style="background: #333; border-radius: 4px; height: 20px; overflow: hidden; margin-bottom: 15px;">
+                        <div id="bulk-send-fill" style="background: #44ff44; height: 100%; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="bulk-send-text" style="color: #888; font-size: 12px;">0 / 0</div>
+                    <div id="bulk-send-results" style="margin-top: 15px; max-height: 200px; overflow-y: auto; font-size: 12px;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeBulkModal()">Close</button>
+                <button class="btn btn-primary" id="bulk-send-btn" onclick="executeBulkSend(false)" style="display: none;">Send All Messages</button>
+                <button class="btn btn-primary" id="bulk-retry-btn" onclick="executeBulkSend(true)" style="display: none; background: #ff8844;">Retry Failed</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Preview Modal -->
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="modal-title">Message Preview</span>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="student-data" id="student-data"></div>
+
+                <!-- Context input (shown first) -->
+                <div id="context-section">
+                    <label style="display: block; margin-bottom: 8px; color: #aaa;">
+                        Additional context for AI (optional):
+                    </label>
+                    <textarea id="context-text" placeholder="e.g., Your practice test will be Friday. These mini-courses will be assigned tomorrow. Great job on last week's call!" style="min-height: 80px; margin-bottom: 15px;"></textarea>
+                    <button class="btn btn-primary" onclick="generateMessage()" id="generate-btn">Generate Message</button>
+                </div>
+
+                <!-- Generated message (shown after generation) -->
+                <div id="message-section" style="display: none;">
+                    <label style="display: block; margin-bottom: 8px; color: #aaa;">
+                        Message (edit as needed):
+                    </label>
+                    <div class="loading" id="loading">Generating message with AI...</div>
+                    <textarea id="message-text" placeholder="Message will appear here..."></textarea>
+                    <div class="send-results" id="send-results" style="display: none;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="back-btn" onclick="showContextSection()" style="display: none;">Back</button>
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" id="send-btn" onclick="sendMessage()" style="display: none;">Send to All 4 Channels</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentStudent = null;
+        let currentCourse = null;
+
+        function toggleSection(header) {
+            const body = header.nextElementSibling;
+            body.classList.toggle('open');
+        }
+
+        function openPreview(student, course) {
+            currentStudent = student;
+            currentCourse = course;
+            document.getElementById('modal-title').textContent = `Message: ${student}`;
+            document.getElementById('context-text').value = '';
+            document.getElementById('message-text').value = '';
+            document.getElementById('send-results').style.display = 'none';
+            document.getElementById('send-btn').disabled = false;
+            document.getElementById('send-btn').textContent = 'Send to All 4 Channels';
+
+            // Show context section, hide message section
+            document.getElementById('context-section').style.display = 'block';
+            document.getElementById('message-section').style.display = 'none';
+            document.getElementById('send-btn').style.display = 'none';
+            document.getElementById('back-btn').style.display = 'none';
+
+            document.getElementById('preview-modal').classList.add('open');
+
+            // Load student data immediately
+            loadStudentData();
+        }
+
+        function closeModal() {
+            document.getElementById('preview-modal').classList.remove('open');
+            currentStudent = null;
+            currentCourse = null;
+        }
+
+        function showContextSection() {
+            document.getElementById('context-section').style.display = 'block';
+            document.getElementById('message-section').style.display = 'none';
+            document.getElementById('send-btn').style.display = 'none';
+            document.getElementById('back-btn').style.display = 'none';
+        }
+
+        async function loadStudentData() {
+            try {
+                const resp = await fetch('/api/comms/preview', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({student_name: currentStudent, course: currentCourse, context: '', skip_generation: true})
+                });
+                const data = await resp.json();
+                if (data.student) {
+                    const s = data.student;
+                    document.getElementById('student-data').innerHTML = `
+                        <dl>
+                            <dt>Course:</dt><dd>${s.course}</dd>
+                            <dt>Rec:</dt><dd>${s.recommendation}</dd>
+                            <dt>Progress:</dt><dd>${s.combined_progress ? s.combined_progress.toFixed(0) : 'N/A'}%</dd>
+                            <dt>XP/day:</dt><dd>${s.daily_xp ? s.daily_xp.toFixed(1) : 'N/A'}</dd>
+                            <dt>Projected:</dt><dd>${s.projected_90 || 'N/A'}</dd>
+                        </dl>
+                    `;
+                }
+            } catch (e) {
+                console.error('Failed to load student data:', e);
+            }
+        }
+
+        async function generateMessage() {
+            const context = document.getElementById('context-text').value.trim();
+
+            // Switch to message section
+            document.getElementById('context-section').style.display = 'none';
+            document.getElementById('message-section').style.display = 'block';
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('message-text').value = '';
+            document.getElementById('send-btn').style.display = 'inline-block';
+            document.getElementById('back-btn').style.display = 'inline-block';
+
+            try {
+                const resp = await fetch('/api/comms/preview', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({student_name: currentStudent, course: currentCourse, context: context})
+                });
+                const data = await resp.json();
+
+                if (data.error) {
+                    document.getElementById('message-text').value = `Error: ${data.error}\n\nWrite your message manually below:`;
+                } else {
+                    document.getElementById('message-text').value = data.message;
+                }
+            } catch (e) {
+                document.getElementById('message-text').value = `Error: ${e.message}\n\nWrite your message manually below:`;
+            }
+
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function regenerateMessage() {
+            showContextSection();
+        }
+
+        async function sendMessage() {
+            const message = document.getElementById('message-text').value.trim();
+            if (!message) {
+                alert('Please enter a message');
+                return;
+            }
+
+            document.getElementById('send-btn').disabled = true;
+            document.getElementById('send-btn').textContent = 'Sending...';
+
+            try {
+                const resp = await fetch('/api/comms/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        student_name: currentStudent,
+                        course: currentCourse,
+                        message: message
+                    })
+                });
+                const data = await resp.json();
+
+                // Show results
+                let html = '<strong>Send Results:</strong><br>';
+                for (const [channel, result] of Object.entries(data)) {
+                    const cls = result.success ? 'result-success' : 'result-fail';
+                    const icon = result.success ? '&#10004;' : '&#10008;';
+                    html += `<span class="${cls}">${icon} ${channel}: ${result.message}</span><br>`;
+                }
+                document.getElementById('send-results').innerHTML = html;
+                document.getElementById('send-results').style.display = 'block';
+                document.getElementById('send-btn').textContent = 'Sent!';
+
+                // Update the row to remove NEW badge
+                const row = document.querySelector(`[data-student="${currentStudent}"][data-course="${currentCourse}"]`);
+                if (row) {
+                    const badge = row.querySelector('.new-badge');
+                    if (badge) badge.remove();
+                    row.dataset.new = 'false';
+                }
+            } catch (e) {
+                alert(`Send failed: ${e.message}`);
+                document.getElementById('send-btn').disabled = false;
+                document.getElementById('send-btn').textContent = 'Send to All 4 Channels';
+            }
+        }
+
+        let bulkStudents = [];
+        let bulkMessages = {};
+        let bulkRecType = '';
+
+        function sendBulk(recType, mode) {
+            const section = event.target.closest('.rec-section');
+            const rows = section.querySelectorAll('.student-row[data-student]');
+            bulkStudents = [];
+            bulkMessages = {};
+            bulkRecType = recType;
+
+            rows.forEach(row => {
+                if (mode === 'all' || (mode === 'new' && row.dataset.new === 'true')) {
+                    bulkStudents.push({
+                        name: row.dataset.student,
+                        course: row.dataset.course
+                    });
+                }
+            });
+
+            if (bulkStudents.length === 0) {
+                alert(mode === 'new' ? 'No new students to send to' : 'No students to send to');
+                return;
+            }
+
+            // Show bulk modal
+            document.getElementById('bulk-modal-title').textContent = `Bulk Send: ${recType}`;
+            document.getElementById('bulk-rec-type').textContent = recType;
+            document.getElementById('bulk-count').textContent = bulkStudents.length;
+            document.getElementById('bulk-student-list').innerHTML = bulkStudents.map(s => s.name).join(', ');
+            document.getElementById('bulk-context-text').value = '';
+
+            // Reset to phase 1
+            document.getElementById('bulk-context-section').style.display = 'block';
+            document.getElementById('bulk-progress-section').style.display = 'none';
+            document.getElementById('bulk-review-section').style.display = 'none';
+            document.getElementById('bulk-send-section').style.display = 'none';
+            document.getElementById('bulk-send-btn').style.display = 'none';
+
+            document.getElementById('bulk-modal').classList.add('open');
+        }
+
+        function closeBulkModal() {
+            document.getElementById('bulk-modal').classList.remove('open');
+            bulkStudents = [];
+            bulkMessages = {};
+        }
+
+        async function startBulkGeneration() {
+            const context = document.getElementById('bulk-context-text').value.trim();
+
+            // Switch to progress phase
+            document.getElementById('bulk-context-section').style.display = 'none';
+            document.getElementById('bulk-progress-section').style.display = 'block';
+
+            const total = bulkStudents.length;
+            let completed = 0;
+
+            for (const student of bulkStudents) {
+                try {
+                    const resp = await fetch('/api/comms/preview', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            student_name: student.name,
+                            course: student.course,
+                            context: context
+                        })
+                    });
+                    const data = await resp.json();
+                    bulkMessages[student.name] = {
+                        course: student.course,
+                        message: data.message || `Error: ${data.error}`,
+                        error: !!data.error
+                    };
+                } catch (e) {
+                    bulkMessages[student.name] = {
+                        course: student.course,
+                        message: `Error: ${e.message}`,
+                        error: true
+                    };
+                }
+
+                completed++;
+                const pct = (completed / total) * 100;
+                document.getElementById('bulk-progress-fill').style.width = pct + '%';
+                document.getElementById('bulk-progress-text').textContent = `${completed} / ${total}`;
+            }
+
+            // Show review phase
+            showBulkReview();
+        }
+
+        function showBulkReview() {
+            document.getElementById('bulk-progress-section').style.display = 'none';
+            document.getElementById('bulk-review-section').style.display = 'block';
+            document.getElementById('bulk-send-btn').style.display = 'inline-block';
+
+            let html = '';
+            let idx = 0;
+            for (const student of bulkStudents) {
+                const msg = bulkMessages[student.name];
+                const color = msg.error ? '#ff4444' : '#ccc';
+                const fullMsg = msg.message || '';
+                const needsExpand = fullMsg.length > 200;
+                const preview = needsExpand ? fullMsg.substring(0, 200) + '...' : fullMsg;
+                html += `
+                    <div style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 8px;">
+                        <strong style="color: #4da6ff;">${student.name}</strong>
+                        <span style="color: #666; font-size: 11px;">(${msg.course})</span>
+                        <div id="msg-preview-${idx}" style="color: ${color}; font-size: 12px; margin-top: 5px; white-space: pre-wrap;">${preview}</div>
+                        <div id="msg-full-${idx}" style="color: ${color}; font-size: 12px; margin-top: 5px; white-space: pre-wrap; display: none;">${fullMsg}</div>
+                        ${needsExpand ? `<button onclick="toggleBulkMsg(${idx})" id="msg-toggle-${idx}" style="background: none; border: none; color: #4da6ff; cursor: pointer; font-size: 11px; padding: 0; margin-top: 5px;">Show full message</button>` : ''}
+                    </div>
+                `;
+                idx++;
+            }
+            document.getElementById('bulk-messages-list').innerHTML = html;
+        }
+
+        function toggleBulkMsg(idx) {
+            const preview = document.getElementById('msg-preview-' + idx);
+            const full = document.getElementById('msg-full-' + idx);
+            const btn = document.getElementById('msg-toggle-' + idx);
+            if (full.style.display === 'none') {
+                preview.style.display = 'none';
+                full.style.display = 'block';
+                btn.textContent = 'Show less';
+            } else {
+                preview.style.display = 'block';
+                full.style.display = 'none';
+                btn.textContent = 'Show full message';
+            }
+        }
+
+        let failedStudents = [];
+
+        async function executeBulkSend(retryOnly = false) {
+            document.getElementById('bulk-review-section').style.display = 'none';
+            document.getElementById('bulk-send-btn').style.display = 'none';
+            document.getElementById('bulk-retry-btn').style.display = 'none';
+            document.getElementById('bulk-send-section').style.display = 'block';
+
+            const studentsToSend = retryOnly ? failedStudents : bulkStudents;
+            failedStudents = [];  // Reset for this run
+
+            const total = studentsToSend.length;
+            let completed = 0;
+            let successCount = 0;
+            let resultsHtml = '';
+
+            for (const student of studentsToSend) {
+                const msg = bulkMessages[student.name];
+                if (msg.error) {
+                    resultsHtml += `<div style="color: #ff8844;">${student.name}: Skipped (generation error)</div>`;
+                    failedStudents.push(student);
+                    completed++;
+                    continue;
+                }
+
+                try {
+                    const resp = await fetch('/api/comms/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            student_name: student.name,
+                            course: msg.course,
+                            message: msg.message
+                        })
+                    });
+                    const data = await resp.json();
+
+                    const slackOk = data.slack_student?.success;
+                    const emailOk = data.email_student?.success;
+                    const anyOk = slackOk || emailOk;
+                    const icon = anyOk ? '&#10004;' : '&#10008;';
+                    const color = anyOk ? '#44ff44' : '#ff4444';
+                    resultsHtml += `<div style="color: ${color};">${icon} ${student.name}: Slack ${slackOk ? 'OK' : 'fail'}, Email ${emailOk ? 'OK' : 'fail'}</div>`;
+
+                    if (anyOk) {
+                        successCount++;
+                        // Update row badge
+                        const row = document.querySelector(`[data-student="${student.name}"][data-course="${msg.course}"]`);
+                        if (row) {
+                            const badge = row.querySelector('.new-badge');
+                            if (badge) badge.remove();
+                            row.dataset.new = 'false';
+                        }
+                    } else {
+                        failedStudents.push(student);
+                    }
+                } catch (e) {
+                    resultsHtml += `<div style="color: #ff4444;">&#10008; ${student.name}: Error - ${e.message}</div>`;
+                    failedStudents.push(student);
+                }
+
+                completed++;
+                const pct = (completed / total) * 100;
+                document.getElementById('bulk-send-fill').style.width = pct + '%';
+                document.getElementById('bulk-send-text').textContent = `${completed} / ${total}`;
+                document.getElementById('bulk-send-results').innerHTML = resultsHtml;
+
+                // Small delay between sends to avoid rate limits
+                await new Promise(r => setTimeout(r, 500));
+            }
+
+            const statusText = retryOnly ? 'Retry complete!' : 'Done!';
+            document.getElementById('bulk-send-text').textContent = `${statusText} ${successCount} succeeded, ${failedStudents.length} failed`;
+
+            // Show retry button if there were failures
+            if (failedStudents.length > 0) {
+                document.getElementById('bulk-retry-btn').style.display = 'inline-block';
+                document.getElementById('bulk-retry-btn').textContent = `Retry ${failedStudents.length} Failed`;
+            }
+        }
+    </script>
+</body>
+</html>
+'''
+
+@app.route('/comms')
+def comms_page():
+    """Communications page - send recommendation-based messages."""
+    data = load_all_data()
+    students = build_unified_table(data)
+    by_rec = get_students_by_recommendation(students)
+
+    # Check if OpenAI is configured
+    config = load_config()
+    openai_configured = bool(config.get('openai_api_key') or os.environ.get('OPENAI_API_KEY'))
+
+    return render_template_string(COMMS_HTML, by_recommendation=by_rec, openai_configured=openai_configured)
+
+
+@app.route('/api/comms/preview', methods=['POST'])
+def api_comms_preview():
+    """Generate message preview for a student."""
+    req = request.json
+    student_name = req.get('student_name')
+    course = req.get('course')
+    context = req.get('context', '')
+    skip_generation = req.get('skip_generation', False)
+
+    # Load student data
+    data = load_all_data()
+    students = build_unified_table(data)
+    student = next((s for s in students if s['student'] == student_name and s['course'] == course), None)
+
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+
+    # If just loading student data (no message generation yet)
+    if skip_generation:
+        return jsonify({'student': student})
+
+    message, error = generate_recommendation_message(student, context)
+    if error:
+        return jsonify({'error': error, 'student': student})
+
+    return jsonify({'message': message, 'student': student})
+
+
+@app.route('/api/comms/send', methods=['POST'])
+def api_comms_send():
+    """Send message to student (all 4 channels)."""
+    req = request.json
+    student_name = req.get('student_name')
+    course = req.get('course')
+    message_text = req.get('message')
+
+    if not message_text:
+        return jsonify({'error': 'No message provided'}), 400
+
+    # Load student data
+    data = load_all_data()
+    students = build_unified_table(data)
+    student = next((s for s in students if s['student'] == student_name and s['course'] == course), None)
+
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+
+    # Send to all channels
+    results = send_recommendation_message(student, message_text)
+
+    # Record in history
+    record_comms_send(student_name, student.get('recommendation', 'Unknown'))
+
+    return jsonify(results)
+
+
+# =============================================================================
+# SETTINGS PAGE
+# =============================================================================
+
+SETTINGS_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Settings - AP Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 10px; color: #fff; }
+        .subtitle { color: #888; margin-bottom: 20px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { color: #4da6ff; margin-right: 20px; text-decoration: none; }
+
+        .card {
+            background: #252540;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            max-width: 600px;
+        }
+        .card h2 { margin-bottom: 15px; font-size: 18px; }
+
+        label { display: block; margin-bottom: 5px; color: #aaa; }
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #444;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #fff;
+            margin-bottom: 15px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+        }
+        .btn-primary { background: #4da6ff; color: #fff; }
+        .btn-secondary { background: #6b7280; color: #fff; }
+        .status { margin-top: 10px; font-size: 12px; }
+        .status-ok { color: #44ff44; }
+        .status-err { color: #ff4444; }
+    </style>
+</head>
+<body>
+    <h1>Settings</h1>
+    <p class="subtitle">Configure integrations</p>
+
+    <nav class="nav">
+        <a href="/">Dashboard</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/refresh">Refresh Data</a>
+        <a href="/settings">Settings</a>
+    </nav>
+
+    <div class="card">
+        <h2>Slack Integration</h2>
+        <form action="/settings/slack" method="POST">
+            <label>Bot Token (xoxb-...)</label>
+            <input type="password" name="slack_token" value="{{ slack_token_masked }}" placeholder="xoxb-your-token">
+            <button type="submit" class="btn btn-primary">Save</button>
+            <a href="/settings/slack/test" class="btn btn-secondary">Test</a>
+        </form>
+        <div class="status {{ 'status-ok' if slack_ok else 'status-err' }}">
+            {{ 'Connected' if slack_ok else 'Not configured' }}
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Email (SMTP)</h2>
+        <form action="/settings/email" method="POST">
+            <label>SMTP Server</label>
+            <input type="text" name="smtp_server" value="{{ email_config.smtp_server }}">
+            <label>SMTP Port</label>
+            <input type="text" name="smtp_port" value="{{ email_config.smtp_port }}">
+            <label>Username</label>
+            <input type="text" name="smtp_username" value="{{ email_config.smtp_username }}">
+            <label>Password</label>
+            <input type="password" name="smtp_password" value="{{ smtp_password_masked }}" placeholder="Enter password">
+            <label>From Email</label>
+            <input type="text" name="from_email" value="{{ email_config.from_email }}">
+            <label>From Name</label>
+            <input type="text" name="from_name" value="{{ email_config.from_name }}">
+            <button type="submit" class="btn btn-primary">Save</button>
+            <a href="/settings/email/test" class="btn btn-secondary">Test</a>
+        </form>
+        <div class="status {{ 'status-ok' if email_ok else 'status-err' }}">
+            {{ 'Configured' if email_ok else 'Not configured' }}
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>OpenAI API</h2>
+        <form action="/settings/openai" method="POST">
+            <label>API Key (sk-...)</label>
+            <input type="password" name="openai_api_key" value="{{ openai_key_masked }}" placeholder="sk-your-api-key">
+            <button type="submit" class="btn btn-primary">Save</button>
+        </form>
+        <div class="status {{ 'status-ok' if openai_ok else 'status-err' }}">
+            {{ 'Configured' if openai_ok else 'Not configured' }}
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+@app.route('/settings')
+def settings_page():
+    """Settings page."""
+    config = load_config()
+
+    slack_token = config.get('slack_token', '')
+    slack_token_masked = slack_token[:10] + '...' if len(slack_token) > 10 else ''
+    slack_ok = bool(slack_token)
+
+    email_config = get_email_config()
+    smtp_password_masked = '********' if email_config.get('smtp_password') else ''
+    email_ok = is_email_configured()
+
+    openai_key = config.get('openai_api_key') or os.environ.get('OPENAI_API_KEY', '')
+    openai_key_masked = openai_key[:10] + '...' if len(openai_key) > 10 else ''
+    openai_ok = bool(openai_key)
+
+    return render_template_string(SETTINGS_HTML,
+        slack_token_masked=slack_token_masked,
+        slack_ok=slack_ok,
+        email_config=email_config,
+        smtp_password_masked=smtp_password_masked,
+        email_ok=email_ok,
+        openai_key_masked=openai_key_masked,
+        openai_ok=openai_ok
+    )
+
+
+@app.route('/settings/slack', methods=['POST'])
+def save_slack_settings():
+    """Save Slack settings."""
+    config = load_config()
+    token = request.form.get('slack_token', '').strip()
+    # Don't overwrite with masked token
+    if token and not token.endswith('...'):
+        config['slack_token'] = token
+        save_config(config)
+        init_slack()
+    return redirect('/settings')
+
+
+@app.route('/settings/slack/test')
+def test_slack():
+    """Test Slack connection."""
+    init_slack()
+    if slack_client:
+        try:
+            slack_client.auth_test()
+            return "Slack connection OK!"
+        except Exception as e:
+            return f"Slack error: {e}"
+    return "Slack not configured"
+
+
+@app.route('/settings/email', methods=['POST'])
+def save_email_settings():
+    """Save email settings."""
+    config = load_config()
+    config['smtp_server'] = request.form.get('smtp_server', '').strip()
+    config['smtp_port'] = int(request.form.get('smtp_port', 587))
+    config['smtp_username'] = request.form.get('smtp_username', '').strip()
+    password = request.form.get('smtp_password', '').strip()
+    if password and password != '********':
+        config['smtp_password'] = password
+    config['from_email'] = request.form.get('from_email', '').strip()
+    config['from_name'] = request.form.get('from_name', '').strip()
+    save_config(config)
+    return redirect('/settings')
+
+
+@app.route('/settings/email/test')
+def test_email():
+    """Test email sending."""
+    config = load_config()
+    to_email = config.get('from_email', '')
+    if not to_email:
+        return "No from_email configured"
+    success, msg = send_email(to_email, "Test Email", "This is a test email from AP Dashboard.")
+    return f"Email {'sent!' if success else 'failed: ' + msg}"
+
+
+@app.route('/settings/openai', methods=['POST'])
+def save_openai_settings():
+    """Save OpenAI settings."""
+    config = load_config()
+    key = request.form.get('openai_api_key', '').strip()
+    if key and not key.endswith('...'):
+        config['openai_api_key'] = key
+        save_config(config)
+    return redirect('/settings')
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 if __name__ == '__main__':
-    print("AP Social Studies Dashboard")
+    # Initialize Slack on startup
+    init_slack()
+
+    print("Unified AP Dashboard")
     print("=" * 50)
-    print("Open: http://localhost:5001")
+    print("Open: http://localhost:5000")
     print()
-    app.run(debug=True, port=5001)
+    print("Pages:")
+    print("  /         - AP Social Studies Dashboard")
+    print("  /coaching - Coaching Schedule")
+    print("  /comms    - Communications Center")
+    print("  /settings - Settings")
+    print()
+    app.run(debug=True, port=5000)
