@@ -5226,8 +5226,8 @@ def generate_external_schedule(start_date, num_weeks=2):
     """
     Generate available time slots for external coach.
 
-    Schedule:
-    - Tuesdays: 1pm - 3pm (UK time)
+    Schedule (Central Time / Austin):
+    - Tuesdays: 1pm - 3pm
     - Wednesdays: 9am - 12pm, 1pm - 2pm (lunch break 12-1)
     - Thursdays: 1:30pm - 3pm
     - Overflow: Mondays/Fridays as needed
@@ -6064,7 +6064,7 @@ EXTERNAL_SCHEDULER_HTML = '''
 
     function generateMessage(consolidated) {
         const sessionList = consolidated.sessions.map((s, i) =>
-            `Session ${i + 1}: ${s.date} at ${s.time} (UK time)\\n   Topic: ${s.topic}`
+            `Session ${i + 1}: ${s.date} at ${s.time} (Central Time)\\n   Topic: ${s.topic}`
         ).join('\\n\\n');
 
         return `Hi ${consolidated.student_name}!
@@ -6171,7 +6171,7 @@ def external_scheduler():
     data = load_all_data()
     students = build_unified_table(data)
 
-    # Start from today at 1pm UK time
+    # Start from today at 1pm Central time
     start_date = datetime.now().replace(hour=13, minute=0, second=0, microsecond=0)
 
     # Generate slots for 2 weeks
