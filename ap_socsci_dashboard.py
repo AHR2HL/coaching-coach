@@ -5488,8 +5488,14 @@ def generate_student_briefing(student):
     return lines
 
 
-def generate_session_topic(student):
-    """Generate a specific recommended topic for this session."""
+def generate_session_topic(student, session_num=1, total_sessions=1):
+    """Generate a specific recommended topic for this session.
+
+    Different sessions get different focuses:
+    - Session 1: Address biggest gap
+    - Session 2: Secondary focus area
+    - Session 3: Exam strategy & confidence
+    """
     pt_mcq = student.get('pt_mcq')
     pt_frq = student.get('pt_frq')
     pt_score = student.get('pt_score')
@@ -5497,15 +5503,22 @@ def generate_session_topic(student):
     rec = student.get('recommendation', '')
     course = student.get('course', '')
 
-    # Priority 1: No PT - discuss exam strategy and what to expect
-    if not pt_score:
-        return {
-            'topic': 'Exam Overview & Strategy',
-            'detail': 'Walk through exam format, timing, question types. Set expectations and create study plan.',
-            'materials': 'Bring sample questions from each section to demonstrate format'
-        }
+    # Helper to get unit name from dict
+    def get_unit_name(u):
+        return u.get('unit_name', u.get('unit_id', str(u))) if isinstance(u, dict) else str(u)
 
-    # Priority 2: Major FRQ gap - focus on writing skills
+    # Build a priority list of topics for this student
+    topics = []
+
+    # Topic: No PT taken - need exam overview
+    if not pt_score:
+        topics.append({
+            'topic': 'Exam Format & What to Expect',
+            'detail': 'Walk through exam structure, timing, question types. Reduce anxiety by demystifying the test.',
+            'materials': 'Bring sample questions from each section to demonstrate format'
+        })
+
+    # Topic: FRQ gap - writing skills
     if pt_mcq and pt_frq and (pt_mcq - pt_frq) > 15:
         frq_types = {
             'APHG': 'FRQ structure (define-explain-example), using specific geographic examples',
@@ -5513,39 +5526,56 @@ def generate_session_topic(student):
             'APWH': 'SAQ/LEQ/DBQ structure, thesis writing, cross-regional comparisons',
             'APGOV': 'FRQ types (Concept Application, SCOTUS Comparison, Argument Essay)'
         }
-        return {
-            'topic': 'FRQ Writing Skills',
-            'detail': f'Student knows content (MCQ {pt_mcq}%) but struggles with writing (FRQ {pt_frq}%). Focus on {frq_types.get(course, "essay structure")}.',
+        topics.append({
+            'topic': 'FRQ Writing Workshop',
+            'detail': f'MCQ {pt_mcq}% vs FRQ {pt_frq}% = knows content, struggles with writing. Focus on {frq_types.get(course, "essay structure")}.',
             'materials': 'Bring 1-2 sample FRQs with rubrics to practice outlining'
-        }
+        })
 
-    # Priority 3: Content gaps - focus on weak units
-    if weak_units:
-        # Extract unit names from dicts
-        def get_unit_name(u):
-            return u.get('unit_name', u.get('unit_id', str(u))) if isinstance(u, dict) else str(u)
-        first_unit = get_unit_name(weak_units[0])
-        weak_names = [get_unit_name(u) for u in weak_units[:2]]
-        return {
-            'topic': f'Content Review: {first_unit}',
-            'detail': f'Key content gaps in {", ".join(weak_names)}. Quick concept review + practice questions.',
-            'materials': f'Bring summary sheet for {first_unit} and 5-10 MCQs on this topic'
-        }
+    # Topic: Weak units (can generate multiple)
+    for i, unit in enumerate(weak_units[:3]):
+        unit_name = get_unit_name(unit)
+        topics.append({
+            'topic': f'Content Deep-Dive: {unit_name}',
+            'detail': f'Targeted review of {unit_name}. Cover key concepts, common misconceptions, and practice questions.',
+            'materials': f'Bring summary sheet for {unit_name} and 5-10 MCQs on this topic'
+        })
 
-    # Priority 4: Low score overall - comprehensive review
+    # Topic: Low score triage
     if pt_score and pt_score <= 2:
-        return {
-            'topic': 'Exam Strategy & Triage',
-            'detail': 'With limited time, identify highest-yield topics. Focus on partial credit strategies for FRQs.',
+        topics.append({
+            'topic': 'High-Yield Topics & Triage',
+            'detail': 'Identify the 20% of content that appears in 80% of questions. Focus on partial credit strategies.',
             'materials': 'Bring list of most-tested topics and scoring guidelines'
-        }
+        })
 
-    # Default: General exam prep
-    return {
-        'topic': 'Exam Strategy & Confidence Building',
-        'detail': 'Review test-taking strategies, time management, and stress management for exam day.',
-        'materials': 'Bring timing guide and sample pacing schedule'
-    }
+    # Topic: MCQ strategies (if MCQ is weak)
+    if pt_mcq and pt_mcq < 50:
+        topics.append({
+            'topic': 'MCQ Attack Strategies',
+            'detail': f'MCQ at {pt_mcq}% - work on process of elimination, reading strategies, and common trap answers.',
+            'materials': 'Bring 15-20 MCQs to practice timed, with discussion of wrong answers'
+        })
+
+    # Always add exam strategy as a possible topic
+    topics.append({
+        'topic': 'Exam Day Strategy & Confidence',
+        'detail': 'Time management, stress management, day-of logistics. Build confidence going into the exam.',
+        'materials': 'Bring timing guide and pacing schedule'
+    })
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_topics = []
+    for t in topics:
+        if t['topic'] not in seen:
+            seen.add(t['topic'])
+            unique_topics.append(t)
+
+    # Return topic based on session number
+    # Session 1 = first priority, Session 2 = second priority, etc.
+    idx = min(session_num - 1, len(unique_topics) - 1)
+    return unique_topics[idx]
 
 
 def generate_external_coach_plan(bookings):
@@ -5580,9 +5610,9 @@ def generate_external_coach_plan(bookings):
         # Generate agenda for this student
         agenda = generate_session_agenda(student)
 
-        # Generate detailed briefing and session topic
+        # Generate detailed briefing and session topic (varies by session number)
         briefing = generate_student_briefing(student)
-        session_topic = generate_session_topic(student)
+        session_topic = generate_session_topic(student, session_num, total_sessions)
 
         booking_detail = {
             'student_name': student.get('student', 'Unknown'),
