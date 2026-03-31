@@ -1785,16 +1785,18 @@ Write a personalized message for this student."""
 
 def send_recommendation_message(student, message_text):
     """
-    Send recommendation message to all 4 channels:
+    Send recommendation message to all channels:
     1. Slack DM to student
     2. Slack DM to coach (record keeping)
     3. Email to student
-    4. Email to guide
+    4. Slack DM to guide
+    5. Email to guide
     """
     results = {
         'slack_student': {'success': False, 'message': 'Not attempted'},
         'slack_coach': {'success': False, 'message': 'Not attempted'},
         'email_student': {'success': False, 'message': 'Not attempted'},
+        'slack_guide': {'success': False, 'message': 'Not attempted'},
         'email_guide': {'success': False, 'message': 'Not attempted'}
     }
 
@@ -1828,7 +1830,16 @@ def send_recommendation_message(student, message_text):
         success, msg = send_email(student_email, subject, message_text, html_body)
         results['email_student'] = {'success': success, 'message': msg}
 
-    # 4. Email to guide
+    # 4. Slack to guide
+    if guide_email:
+        guide_name = guide_info.get('name', 'Guide')
+        guide_msg = f"[FYI] Coaching message sent to {student_name}:\n\n{message_text}"
+        success, msg = send_slack_dm(guide_email, guide_msg)
+        results['slack_guide'] = {'success': success, 'message': msg}
+    else:
+        results['slack_guide'] = {'success': False, 'message': 'No guide assigned'}
+
+    # 5. Email to guide
     if guide_email:
         guide_name = guide_info.get('name', 'Guide')
         guide_subject = f"[FYI] AP Coaching Message to {student_name}"
@@ -5958,22 +5969,31 @@ EXTERNAL_SCHEDULER_HTML = '''
 
     <!-- Blast Modal -->
     <div class="modal" id="blast-modal">
-        <div class="modal-content">
+        <div class="modal-content" style="max-width: 800px;">
             <div class="modal-header">
                 <span>Send Booking Notifications</span>
                 <button class="close-btn" onclick="closeBlastModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <div id="blast-confirm">
-                    <p style="margin-bottom: 15px;">Send booking confirmations to <strong>{{ plan.summary.scheduled }}</strong> students?</p>
-                    <p style="color: #888; font-size: 13px;">Each student will receive their scheduled time and session agenda via Slack and email.</p>
+                <div id="blast-preview">
+                    <p style="margin-bottom: 15px;">Send booking confirmations to <strong id="unique-student-count"></strong> students?</p>
+                    <p style="color: #888; font-size: 13px; margin-bottom: 15px;">Each student will receive ONE message listing ALL their sessions.</p>
+
+                    <div style="margin-bottom: 15px;">
+                        <label style="color: #aaa; font-size: 12px;">Select a student to preview their message:</label>
+                        <select id="preview-select" onchange="showPreview()" style="width: 100%; padding: 8px; background: #1a1a2e; color: #fff; border: 1px solid #444; border-radius: 4px; margin-top: 5px;">
+                        </select>
+                    </div>
+
+                    <div id="message-preview" style="background: #1a1a2e; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow-y: auto; border: 1px solid #444;">
+                    </div>
                 </div>
                 <div id="blast-progress" style="display: none;">
                     <p>Sending notifications...</p>
                     <div class="progress-bar">
                         <div class="progress-fill" id="progress-fill"></div>
                     </div>
-                    <p id="progress-text" style="color: #888; font-size: 12px;">0 / {{ plan.summary.scheduled }}</p>
+                    <p id="progress-text" style="color: #888; font-size: 12px;">0 / 0</p>
                     <div id="blast-results" style="margin-top: 15px; max-height: 200px; overflow-y: auto; font-size: 12px;"></div>
                 </div>
             </div>
@@ -5987,11 +6007,70 @@ EXTERNAL_SCHEDULER_HTML = '''
     <script>
     const bookings = {{ bookings_json | safe }};
 
+    // Consolidate bookings by student
+    function getConsolidatedBookings() {
+        const byStudent = {};
+        for (const b of bookings.filter(b => b.scheduled)) {
+            const key = b.student_name + '|' + b.course;
+            if (!byStudent[key]) {
+                byStudent[key] = {
+                    student_name: b.student_name,
+                    course: b.course,
+                    sessions: []
+                };
+            }
+            byStudent[key].sessions.push({
+                date: b.slot.display,
+                time: b.slot.time,
+                topic: b.session_topic?.topic || 'Exam Strategy'
+            });
+        }
+        // Sort sessions by date
+        for (const key in byStudent) {
+            byStudent[key].sessions.sort((a, b) => a.date.localeCompare(b.date));
+        }
+        return Object.values(byStudent);
+    }
+
+    function generateMessage(consolidated) {
+        const sessionList = consolidated.sessions.map((s, i) =>
+            `Session ${i + 1}: ${s.date} at ${s.time} (UK time)\\n   Topic: ${s.topic}`
+        ).join('\\n\\n');
+
+        return `Hi ${consolidated.student_name}!
+
+Your AP Exam Strategy sessions have been scheduled:
+
+${sessionList}
+
+Each session is 20 minutes. Please be ready a few minutes early.
+
+Looking forward to helping you prepare for the ${consolidated.course} exam!`;
+    }
+
     function openBlastModal() {
-        document.getElementById('blast-confirm').style.display = 'block';
+        const consolidated = getConsolidatedBookings();
+        document.getElementById('unique-student-count').textContent = consolidated.length;
+
+        // Populate preview dropdown
+        const select = document.getElementById('preview-select');
+        select.innerHTML = consolidated.map((c, i) =>
+            `<option value="${i}">${c.student_name} (${c.course}) - ${c.sessions.length} session(s)</option>`
+        ).join('');
+
+        showPreview();
+
+        document.getElementById('blast-preview').style.display = 'block';
         document.getElementById('blast-progress').style.display = 'none';
         document.getElementById('blast-send-btn').style.display = 'inline-block';
         document.getElementById('blast-modal').classList.add('open');
+    }
+
+    function showPreview() {
+        const consolidated = getConsolidatedBookings();
+        const idx = parseInt(document.getElementById('preview-select').value) || 0;
+        const message = generateMessage(consolidated[idx]);
+        document.getElementById('message-preview').textContent = message;
     }
 
     function closeBlastModal() {
@@ -5999,49 +6078,44 @@ EXTERNAL_SCHEDULER_HTML = '''
     }
 
     async function executeBlast() {
-        document.getElementById('blast-confirm').style.display = 'none';
+        document.getElementById('blast-preview').style.display = 'none';
         document.getElementById('blast-progress').style.display = 'block';
         document.getElementById('blast-send-btn').style.display = 'none';
 
-        const scheduled = bookings.filter(b => b.scheduled);
-        const total = scheduled.length;
+        const consolidated = getConsolidatedBookings();
+        const total = consolidated.length;
         let completed = 0;
         let successCount = 0;
         let resultsHtml = '';
 
-        for (const booking of scheduled) {
+        for (const student of consolidated) {
             try {
-                const message = `Hi ${booking.student_name}!
-
-Your AP Exam Strategy session has been scheduled:
-
-Date: ${booking.slot.display}
-Time: ${booking.slot.time} (UK time)
-Duration: 20 minutes
-
-Session Focus:
-${booking.agenda.sections.map(s => '- ' + s.title).join('\\n')}
-
-Please be ready a few minutes early. Looking forward to helping you prepare!`;
+                const message = generateMessage(student);
 
                 const resp = await fetch('/api/comms/send', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
-                        student_name: booking.student_name,
-                        course: booking.course,
+                        student_name: student.student_name,
+                        course: student.course,
                         message: message
                     })
                 });
                 const data = await resp.json();
 
-                const anyOk = data.slack_student?.success || data.email_student?.success;
+                const anyOk = data.slack_student?.success || data.email_student?.success ||
+                             data.slack_guide?.success || data.email_guide?.success;
                 const icon = anyOk ? '✓' : '✗';
                 const color = anyOk ? '#44ff44' : '#ff4444';
-                resultsHtml += `<div style="color: ${color};">${icon} ${booking.student_name}</div>`;
+                const channels = [];
+                if (data.slack_student?.success) channels.push('Slack');
+                if (data.email_student?.success) channels.push('Email');
+                if (data.slack_guide?.success) channels.push('Guide-Slack');
+                if (data.email_guide?.success) channels.push('Guide-Email');
+                resultsHtml += `<div style="color: ${color};">${icon} ${student.student_name} (${student.sessions.length} sessions) - ${channels.join(', ') || 'failed'}</div>`;
                 if (anyOk) successCount++;
             } catch (e) {
-                resultsHtml += `<div style="color: #ff4444;">✗ ${booking.student_name}: ${e.message}</div>`;
+                resultsHtml += `<div style="color: #ff4444;">✗ ${student.student_name}: ${e.message}</div>`;
             }
 
             completed++;
