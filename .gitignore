@@ -64,3 +64,11 @@ ap*_practice_tests_built.json
 # Dashboard state files (student data)
 recommendation_lock.json
 ap_comms_history.json
+coaching_notes.json
+coaching_allocation_*.md
+
+# Self-assessment survey data (student PII)
+self_assessment/
+
+# Environment files
+.env

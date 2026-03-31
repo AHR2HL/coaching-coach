@@ -80,6 +80,16 @@ DATA_DIR = BASE_DIR / 'adam_ss_bundle'
 CONFIG_FILE = BASE_DIR / 'dashboard_config.json'
 COMMS_HISTORY_FILE = BASE_DIR / 'ap_comms_history.json'
 RECOMMENDATION_LOCK_FILE = BASE_DIR / 'recommendation_lock.json'
+SELF_ASSESSMENT_DIR = BASE_DIR / 'self_assessment'
+COACHING_NOTES_FILE = BASE_DIR / 'coaching_notes.json'
+
+# Survey course name mapping
+SURVEY_COURSE_MAP = {
+    'AP Human Geography': 'APHG',
+    'AP US Government & Politics': 'APGOV',
+    'AP US History': 'APUSH',
+    'AP World History: Modern': 'APWH',
+}
 
 # =============================================================================
 # CONFIG MANAGEMENT
@@ -96,6 +106,1288 @@ def save_config(config):
     """Save dashboard configuration."""
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
+
+# =============================================================================
+# SELF-ASSESSMENT SURVEY DATA
+# =============================================================================
+
+def load_self_assessment_data():
+    """Load all self-assessment survey CSVs and return parsed data."""
+    surveys = {}
+
+    if not SELF_ASSESSMENT_DIR.exists():
+        return surveys
+
+    for csv_file in SELF_ASSESSMENT_DIR.glob('*.csv'):
+        try:
+            df = pd.read_csv(csv_file)
+            if len(df) == 0:
+                continue
+
+            # Determine course from filename or Course column
+            course_col = df.get('Course')
+            if course_col is not None and len(course_col) > 0:
+                survey_course = course_col.iloc[0]
+            else:
+                # Infer from filename
+                fname = csv_file.stem
+                if 'Human Geography' in fname:
+                    survey_course = 'AP Human Geography'
+                elif 'Government' in fname:
+                    survey_course = 'AP US Government & Politics'
+                elif 'US History' in fname:
+                    survey_course = 'AP US History'
+                elif 'World History' in fname:
+                    survey_course = 'AP World History: Modern'
+                else:
+                    continue
+
+            norm_course = SURVEY_COURSE_MAP.get(survey_course, survey_course)
+
+            for _, row in df.iterrows():
+                # Get student name (normalize)
+                name_raw = row.get('Your Name', '')
+                if pd.isna(name_raw) or not name_raw:
+                    continue
+                name = str(name_raw).strip().title()
+
+                # Parse confidence ratings (1-4 scale)
+                unit_scores = []
+                skill_scores = []
+                frq_scores = []
+
+                for col in df.columns:
+                    val = row.get(col)
+                    if pd.isna(val) or not isinstance(val, str):
+                        continue
+
+                    # Extract numeric confidence (1-4)
+                    if val.startswith(('1 -', '2 -', '3 -', '4 -')):
+                        score = int(val[0])
+                        col_lower = col.lower()
+
+                        # Categorize the rating
+                        if 'unit' in col_lower or 'period' in col_lower:
+                            unit_scores.append(score)
+                        elif any(x in col_lower for x in ['thesis', 'evidence', 'answering all', 'organizing', 'finishing']):
+                            frq_scores.append(score)
+                        else:
+                            skill_scores.append(score)
+
+                # Calculate aggregate confidence (0-100 scale)
+                all_scores = unit_scores + skill_scores + frq_scores
+                if all_scores:
+                    # Convert 1-4 to 0-100: (avg - 1) / 3 * 100
+                    avg_score = sum(all_scores) / len(all_scores)
+                    confidence_pct = round((avg_score - 1) / 3 * 100)
+                else:
+                    confidence_pct = None
+
+                # Get predicted and target scores
+                predicted_raw = row.get('If you took the full AP exam TODAY, what score do you think you\'d get?')
+                target_raw = row.get('What score are you aiming for?')
+
+                predicted = None
+                if pd.notna(predicted_raw):
+                    try:
+                        predicted = int(str(predicted_raw).strip()[0])
+                    except (ValueError, IndexError):
+                        pass
+
+                target = None
+                if pd.notna(target_raw):
+                    target_str = str(target_raw).strip()
+                    if target_str.startswith('5'):
+                        target = 5
+                    elif target_str.startswith('4'):
+                        target = 4
+                    elif target_str.startswith('3'):
+                        target = 3
+                    elif target_str.startswith('2'):
+                        target = 2
+                    elif target_str.startswith('1'):
+                        target = 1
+
+                # Get open-ended concerns
+                worry = row.get("What's the ONE thing you're most worried about for this exam?", '')
+                help_needed = row.get("Is there a specific topic, skill, or question type you'd like more help with?", '')
+                other = row.get("Anything else we should know about how you're feeling about the exam?", '')
+
+                # Find weak areas (score 1 or 2)
+                weak_units = []
+                weak_skills = []
+
+                for col in df.columns:
+                    val = row.get(col)
+                    if pd.isna(val) or not isinstance(val, str):
+                        continue
+                    if val.startswith(('1 -', '2 -')):
+                        score = int(val[0])
+                        col_clean = col.replace('Unit ', 'U').replace('Period ', 'P')
+                        if 'unit' in col.lower() or 'period' in col.lower():
+                            weak_units.append({'name': col_clean, 'score': score})
+                        else:
+                            weak_skills.append({'name': col, 'score': score})
+
+                # Generate recommendations based on survey
+                recommendations = []
+
+                # FRQ-specific weak areas
+                frq_weak_skills = [s for s in weak_skills if any(x in s['name'].lower() for x in
+                    ['thesis', 'evidence', 'answering all', 'organizing', 'frq', 'leq', 'dbq', 'saq'])]
+                if frq_weak_skills:
+                    recommendations.append({
+                        'type': 'FRQ',
+                        'priority': 'high' if any(s['score'] == 1 for s in frq_weak_skills) else 'medium',
+                        'detail': f"Weak FRQ skills: {', '.join(s['name'] for s in frq_weak_skills[:3])}"
+                    })
+
+                # Content gaps
+                if weak_units:
+                    recommendations.append({
+                        'type': 'Content',
+                        'priority': 'high' if any(u['score'] == 1 for u in weak_units) else 'medium',
+                        'detail': f"Review needed: {', '.join(u['name'] for u in weak_units[:4])}"
+                    })
+
+                # Stress/anxiety
+                stress_cols = [c for c in df.columns if 'stress' in c.lower() or 'anxiety' in c.lower() or 'pressure' in c.lower()]
+                for col in stress_cols:
+                    val = row.get(col)
+                    if pd.notna(val) and isinstance(val, str) and val.startswith('1 -'):
+                        recommendations.append({
+                            'type': 'Support',
+                            'priority': 'high',
+                            'detail': 'Struggling with exam anxiety/stress - consider mindset coaching'
+                        })
+                        break
+
+                # Time management
+                time_cols = [c for c in df.columns if 'pace' in c.lower() or 'time' in c.lower()]
+                time_issues = []
+                for col in time_cols:
+                    val = row.get(col)
+                    if pd.notna(val) and isinstance(val, str) and val.startswith(('1 -', '2 -')):
+                        time_issues.append(col)
+                if time_issues:
+                    recommendations.append({
+                        'type': 'Pacing',
+                        'priority': 'medium',
+                        'detail': 'Practice timed conditions'
+                    })
+
+                # Store survey data
+                key = (name, norm_course)
+                surveys[key] = {
+                    'name': name,
+                    'email': row.get('Your Email', ''),
+                    'course': norm_course,
+                    'confidence': confidence_pct,
+                    'predicted_score': predicted,
+                    'target_score': target,
+                    'unit_avg': round(sum(unit_scores) / len(unit_scores), 1) if unit_scores else None,
+                    'skill_avg': round(sum(skill_scores) / len(skill_scores), 1) if skill_scores else None,
+                    'frq_avg': round(sum(frq_scores) / len(frq_scores), 1) if frq_scores else None,
+                    'weak_units': weak_units,
+                    'weak_skills': weak_skills,
+                    'worry': str(worry) if pd.notna(worry) and worry else None,
+                    'help_needed': str(help_needed) if pd.notna(help_needed) and help_needed else None,
+                    'other': str(other) if pd.notna(other) and other else None,
+                    'recommendations': recommendations,
+                    'timestamp': row.get('Timestamp', ''),
+                }
+
+        except Exception as e:
+            print(f"Error loading survey {csv_file}: {e}")
+            continue
+
+    return surveys
+
+
+def get_student_survey(surveys, student_name, course):
+    """Get survey data for a specific student and course."""
+    # Try exact match first
+    key = (student_name, course)
+    if key in surveys:
+        return surveys[key]
+
+    # Try matching by first name
+    first_name = student_name.split()[0].lower()
+    for (name, surv_course), data in surveys.items():
+        if surv_course == course and name.lower().split()[0] == first_name:
+            return data
+
+    # Try matching by last name (handles Saeed/Said type variations)
+    if len(student_name.split()) >= 2:
+        last_name = student_name.split()[-1].lower()
+        for (name, surv_course), data in surveys.items():
+            if surv_course == course and len(name.split()) >= 2:
+                if name.lower().split()[-1] == last_name:
+                    return data
+
+    return None
+
+
+def get_students_without_survey(students, surveys):
+    """Get list of students who haven't completed the survey, grouped by course."""
+    missing = {}
+
+    for s in students:
+        name = s.get('student', '')
+        course = s.get('course', '')
+        if not name or not course:
+            continue
+
+        survey = get_student_survey(surveys, name, course)
+        if survey is None:
+            if course not in missing:
+                missing[course] = []
+            missing[course].append({
+                'student': name,
+                'course': course,
+                'email': s.get('email', ''),
+                'risk': s.get('risk', 'Unknown'),
+                'combined_progress': s.get('combined_progress')
+            })
+
+    return missing
+
+
+def generate_coaching_insights(student):
+    """
+    Generate unified coaching insights by triangulating:
+    - Survey data (self-assessment)
+    - Quantitative data (Timeback, Austin Way, PT)
+    - Coaching notes (qualitative observations from calls)
+    """
+    insights = {
+        'blind_spots': [],      # Confident but data shows weak (dangerous)
+        'false_worries': [],    # Worried but data shows strong (reassure)
+        'confirmed_gaps': [],   # Both agree it's weak (priority)
+        'confirmed_strengths': [],  # Both agree it's strong
+        'data_only_gaps': [],   # Data shows weak, no survey data
+        'priority_actions': [], # Top recommended actions
+        'from_coaching': [],    # Insights from coaching notes
+    }
+
+    survey = student.get('survey')
+    unit_details = student.get('unit_details', [])
+    coaching_patterns = student.get('coaching_patterns')
+    frq_accuracy = student.get('tb_frq_accuracy')
+    mcq_accuracy = student.get('tb_mcq_accuracy')
+    weak_units_data = student.get('weak_units', [])  # From quantitative analysis
+
+    # Build unit mastery lookup from quantitative data
+    unit_mastery = {}
+    for ud in unit_details:
+        if not ud.get('non_ced', False):
+            unit_num = ud.get('unit', '')
+            unit_mastery[str(unit_num)] = ud.get('combined', 0)
+
+    if survey:
+        survey_weak_units = survey.get('weak_units', [])
+        survey_frq_avg = survey.get('frq_avg')
+
+        # === UNIT-LEVEL ANALYSIS ===
+        # Map survey unit names to unit numbers
+        for sw in survey_weak_units:
+            unit_name = sw.get('name', '')
+            confidence = sw.get('score', 2)  # 1-4 scale
+
+            # Extract unit number from name (e.g., "U7" -> "7", "P3" -> "3")
+            unit_num = None
+            if unit_name.startswith('U') or unit_name.startswith('P'):
+                parts = unit_name.split(':')[0].replace('U', '').replace('P', '').strip()
+                if parts.isdigit():
+                    unit_num = parts
+
+            if unit_num and unit_num in unit_mastery:
+                mastery = unit_mastery[unit_num]
+                is_confident = confidence >= 3  # 3-4 = confident
+                is_mastered = mastery >= 60     # 60%+ = mastered
+
+                if is_confident and not is_mastered:
+                    insights['blind_spots'].append({
+                        'area': f'Unit {unit_num}',
+                        'detail': unit_name,
+                        'self_rating': f'{confidence}/4 confident',
+                        'actual': f'{mastery:.0f}% mastery',
+                        'action': 'Review needed - confidence exceeds actual performance'
+                    })
+                elif not is_confident and is_mastered:
+                    insights['false_worries'].append({
+                        'area': f'Unit {unit_num}',
+                        'detail': unit_name,
+                        'self_rating': f'{confidence}/4 confident',
+                        'actual': f'{mastery:.0f}% mastery',
+                        'action': 'Reassure - performing better than they think'
+                    })
+                elif not is_confident and not is_mastered:
+                    insights['confirmed_gaps'].append({
+                        'area': f'Unit {unit_num}',
+                        'detail': unit_name,
+                        'self_rating': f'{confidence}/4 confident',
+                        'actual': f'{mastery:.0f}% mastery',
+                        'action': 'Priority review - both perception and data show gap'
+                    })
+
+        # Check for blind spots in units student didn't mark as weak
+        marked_weak_units = set()
+        for sw in survey_weak_units:
+            unit_name = sw.get('name', '')
+            if unit_name.startswith('U') or unit_name.startswith('P'):
+                parts = unit_name.split(':')[0].replace('U', '').replace('P', '').strip()
+                if parts.isdigit():
+                    marked_weak_units.add(parts)
+
+        for unit_num, mastery in unit_mastery.items():
+            if unit_num not in marked_weak_units and mastery < 60:
+                insights['blind_spots'].append({
+                    'area': f'Unit {unit_num}',
+                    'detail': f'Unit {unit_num}',
+                    'self_rating': 'Not flagged as weak',
+                    'actual': f'{mastery:.0f}% mastery',
+                    'action': 'Blind spot - student may not realize this needs work'
+                })
+
+        # === FRQ ANALYSIS ===
+        if survey_frq_avg is not None and frq_accuracy is not None:
+            frq_confident = survey_frq_avg >= 3
+            frq_strong = frq_accuracy >= 70
+
+            if frq_confident and not frq_strong:
+                insights['blind_spots'].append({
+                    'area': 'FRQ Skills',
+                    'detail': 'Free Response Questions',
+                    'self_rating': f'{survey_frq_avg}/4 confident',
+                    'actual': f'{frq_accuracy:.0f}% accuracy',
+                    'action': 'FRQ practice needed - overconfident'
+                })
+            elif not frq_confident and frq_strong:
+                insights['false_worries'].append({
+                    'area': 'FRQ Skills',
+                    'detail': 'Free Response Questions',
+                    'self_rating': f'{survey_frq_avg}/4 confident',
+                    'actual': f'{frq_accuracy:.0f}% accuracy',
+                    'action': 'Reassure - FRQ performance is actually strong'
+                })
+            elif not frq_confident and not frq_strong:
+                insights['confirmed_gaps'].append({
+                    'area': 'FRQ Skills',
+                    'detail': 'Free Response Questions',
+                    'self_rating': f'{survey_frq_avg}/4 confident',
+                    'actual': f'{frq_accuracy:.0f}% accuracy',
+                    'action': 'Priority - both feel weak and data confirms'
+                })
+
+        # === PREDICTED vs ACTUAL ANALYSIS ===
+        predicted = survey.get('predicted_score')
+        pt_score = student.get('pt_score')
+        if predicted and pt_score:
+            if predicted > pt_score + 1:
+                insights['blind_spots'].append({
+                    'area': 'Overall Readiness',
+                    'detail': 'Predicted vs Practice Test',
+                    'self_rating': f'Predicts {predicted}',
+                    'actual': f'PT score: {pt_score}',
+                    'action': 'Reality check needed - significant gap between expectation and performance'
+                })
+            elif predicted < pt_score:
+                insights['false_worries'].append({
+                    'area': 'Overall Readiness',
+                    'detail': 'Predicted vs Practice Test',
+                    'self_rating': f'Predicts {predicted}',
+                    'actual': f'PT score: {pt_score}',
+                    'action': 'Confidence boost - performing better than they expect'
+                })
+
+        # === STRESS/ANXIETY from survey ===
+        for rec in survey.get('recommendations', []):
+            if rec.get('type') == 'Support':
+                insights['priority_actions'].append({
+                    'type': 'Mindset',
+                    'action': rec.get('detail', 'Address exam anxiety'),
+                    'source': 'Self-reported'
+                })
+
+    else:
+        # No survey - use data-only gaps
+        for wu in weak_units_data:
+            insights['data_only_gaps'].append({
+                'area': wu.get('unit_name', 'Unknown'),
+                'actual': f"{wu.get('mastery', 0)}% mastery",
+                'action': 'Review needed (no self-assessment available)'
+            })
+
+        if frq_accuracy is not None and frq_accuracy < 70:
+            insights['data_only_gaps'].append({
+                'area': 'FRQ Skills',
+                'actual': f'{frq_accuracy:.0f}% accuracy',
+                'action': 'FRQ practice recommended'
+            })
+
+    # === INTEGRATE COACHING NOTES ===
+    if coaching_patterns:
+        # Add recurring concerns from coaching calls
+        for concern in coaching_patterns.get('recurring_concerns', [])[:2]:
+            insights['from_coaching'].append({
+                'type': 'Recurring Concern',
+                'detail': concern,
+                'sessions': coaching_patterns.get('total_sessions', 0)
+            })
+
+        # Add pending action items
+        for action in coaching_patterns.get('pending_actions', [])[:2]:
+            insights['from_coaching'].append({
+                'type': 'Action Item',
+                'detail': action,
+                'sessions': coaching_patterns.get('total_sessions', 0)
+            })
+
+        # Add recent strengths observed
+        for strength in coaching_patterns.get('recent_strengths', [])[:2]:
+            insights['from_coaching'].append({
+                'type': 'Strength Observed',
+                'detail': strength,
+                'sessions': coaching_patterns.get('total_sessions', 0)
+            })
+
+        # Add trajectory info
+        insights['coaching_trajectory'] = coaching_patterns.get('trajectory', 'unknown')
+        insights['coaching_sessions'] = coaching_patterns.get('total_sessions', 0)
+        insights['latest_sentiment'] = coaching_patterns.get('latest_sentiment', 'unknown')
+
+    # === GENERATE PRIORITY ACTIONS ===
+    # Coaching concerns are highest priority (human-observed)
+    if coaching_patterns:
+        for concern in coaching_patterns.get('recurring_concerns', [])[:1]:
+            insights['priority_actions'].append({
+                'type': 'Coach Observed',
+                'action': concern,
+                'source': f"Recurring across {coaching_patterns.get('total_sessions', 0)} sessions"
+            })
+
+    # Blind spots are next priority (dangerous)
+    for bs in insights['blind_spots'][:2]:
+        insights['priority_actions'].append({
+            'type': 'Blind Spot',
+            'action': f"{bs['area']}: {bs['action']}",
+            'source': 'Data vs Self-Assessment mismatch'
+        })
+
+    # Confirmed gaps are next priority
+    for cg in insights['confirmed_gaps'][:2]:
+        insights['priority_actions'].append({
+            'type': 'Confirmed Gap',
+            'action': f"{cg['area']}: {cg['action']}",
+            'source': 'Both data and student agree'
+        })
+
+    # False worries - mention for reassurance
+    if insights['false_worries']:
+        insights['priority_actions'].append({
+            'type': 'Reassurance',
+            'action': f"Student underestimates themselves in: {', '.join(fw['area'] for fw in insights['false_worries'][:3])}",
+            'source': 'Performing better than they think'
+        })
+
+    return insights
+
+
+# =============================================================================
+# COACHING NOTES (Qualitative Data from Calls)
+# =============================================================================
+
+def load_coaching_notes():
+    """Load all coaching notes."""
+    if COACHING_NOTES_FILE.exists():
+        try:
+            with open(COACHING_NOTES_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_coaching_notes(notes):
+    """Save coaching notes."""
+    with open(COACHING_NOTES_FILE, 'w') as f:
+        json.dump(notes, f, indent=2)
+
+
+def extract_insights_from_notes(raw_notes, student_name, course):
+    """
+    Use OpenAI to extract structured insights from free-form coaching notes.
+    Returns extracted themes, action items, concerns, strengths, and sentiment.
+    """
+    if not OPENAI_AVAILABLE:
+        return {
+            'themes': [],
+            'action_items': [],
+            'concerns': [],
+            'strengths': [],
+            'sentiment': 'unknown',
+            'summary': raw_notes[:200] + '...' if len(raw_notes) > 200 else raw_notes,
+            'processed': False
+        }
+
+    config = load_config()
+    api_key = config.get('openai_api_key') or os.environ.get('OPENAI_API_KEY', '')
+
+    if not api_key:
+        return {
+            'themes': [],
+            'action_items': [],
+            'concerns': [],
+            'strengths': [],
+            'sentiment': 'unknown',
+            'summary': raw_notes[:200] + '...' if len(raw_notes) > 200 else raw_notes,
+            'processed': False
+        }
+
+    try:
+        client = openai.OpenAI(api_key=api_key)
+
+        prompt = f"""Analyze these coaching notes for {student_name} ({course}) and extract structured insights.
+
+Notes:
+{raw_notes}
+
+Return a JSON object with these fields:
+- themes: array of 2-5 key topics/skills discussed (e.g., "FRQ structure", "time management", "Unit 4 content")
+- action_items: array of specific next steps or commitments made (e.g., "Complete 2 practice FRQs by Friday")
+- concerns: array of struggles, challenges, or areas needing attention
+- strengths: array of positive observations, progress made, or things going well
+- sentiment: one of "struggling", "mixed", "improving", "strong" - overall tone of the session
+- summary: 1-2 sentence summary of the coaching call
+
+Return ONLY valid JSON, no markdown formatting."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.3
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Clean up potential markdown formatting
+        if result_text.startswith('```'):
+            result_text = result_text.split('```')[1]
+            if result_text.startswith('json'):
+                result_text = result_text[4:]
+            result_text = result_text.strip()
+
+        extracted = json.loads(result_text)
+        extracted['processed'] = True
+        return extracted
+
+    except Exception as e:
+        print(f"Error extracting insights: {e}")
+        return {
+            'themes': [],
+            'action_items': [],
+            'concerns': [],
+            'strengths': [],
+            'sentiment': 'unknown',
+            'summary': raw_notes[:200] + '...' if len(raw_notes) > 200 else raw_notes,
+            'processed': False,
+            'error': str(e)
+        }
+
+
+def add_coaching_note(student_name, course, raw_notes, call_date=None):
+    """Add a coaching note for a student and extract insights."""
+    notes = load_coaching_notes()
+    key = f"{student_name}|{course}"
+
+    if key not in notes:
+        notes[key] = []
+
+    # Extract insights using NLP
+    extracted = extract_insights_from_notes(raw_notes, student_name, course)
+
+    note_entry = {
+        'date': call_date or datetime.now().strftime('%Y-%m-%d'),
+        'timestamp': datetime.now().isoformat(),
+        'raw_notes': raw_notes,
+        'extracted': extracted
+    }
+
+    notes[key].append(note_entry)
+    save_coaching_notes(notes)
+
+    return note_entry
+
+
+def get_student_notes(student_name, course, limit=5):
+    """Get recent coaching notes for a student."""
+    notes = load_coaching_notes()
+    key = f"{student_name}|{course}"
+    student_notes = notes.get(key, [])
+
+    # Sort by date descending and limit
+    sorted_notes = sorted(student_notes, key=lambda x: x.get('timestamp', ''), reverse=True)
+    return sorted_notes[:limit]
+
+
+def get_coaching_patterns(student_name, course):
+    """
+    Analyze patterns across all coaching notes for a student.
+    Returns aggregated themes, recurring concerns, and progress trajectory.
+    """
+    notes = get_student_notes(student_name, course, limit=10)
+
+    if not notes:
+        return None
+
+    # Aggregate themes, concerns, strengths across all notes
+    all_themes = []
+    all_concerns = []
+    all_strengths = []
+    all_action_items = []
+    sentiments = []
+
+    for note in notes:
+        extracted = note.get('extracted', {})
+        all_themes.extend(extracted.get('themes', []))
+        all_concerns.extend(extracted.get('concerns', []))
+        all_strengths.extend(extracted.get('strengths', []))
+        all_action_items.extend(extracted.get('action_items', []))
+        if extracted.get('sentiment'):
+            sentiments.append(extracted['sentiment'])
+
+    # Count frequency of themes/concerns
+    from collections import Counter
+    theme_counts = Counter(all_themes)
+    concern_counts = Counter(all_concerns)
+
+    # Determine trajectory from sentiments
+    sentiment_order = {'struggling': 1, 'mixed': 2, 'improving': 3, 'strong': 4}
+    if len(sentiments) >= 2:
+        recent_avg = sum(sentiment_order.get(s, 2) for s in sentiments[:2]) / 2
+        older_avg = sum(sentiment_order.get(s, 2) for s in sentiments[2:]) / max(len(sentiments[2:]), 1)
+        if recent_avg > older_avg + 0.5:
+            trajectory = 'improving'
+        elif recent_avg < older_avg - 0.5:
+            trajectory = 'declining'
+        else:
+            trajectory = 'stable'
+    else:
+        trajectory = 'insufficient_data'
+
+    return {
+        'total_sessions': len(notes),
+        'recurring_themes': [t for t, c in theme_counts.most_common(5)],
+        'recurring_concerns': [c for c, _ in concern_counts.most_common(3)],
+        'recent_strengths': all_strengths[:5],
+        'pending_actions': all_action_items[:5],
+        'trajectory': trajectory,
+        'latest_sentiment': sentiments[0] if sentiments else 'unknown',
+        'latest_date': notes[0].get('date') if notes else None
+    }
+
+
+# =============================================================================
+# COACHING PLANNER - Need Assessment & Time Allocation
+# =============================================================================
+
+def calculate_coaching_need(student):
+    """
+    Calculate a coaching need score (0-100) for a student.
+    Higher = more urgent need for coaching time.
+    """
+    score = 0
+    factors = []
+
+    # Risk level (0-30 points)
+    risk = student.get('risk', 'Unknown')
+    risk_scores = {'Critical': 30, 'At Risk': 20, 'On Track': 8, 'Strong': 2, 'Unknown': 15}
+    risk_pts = risk_scores.get(risk, 15)
+    score += risk_pts
+    if risk_pts >= 20:
+        factors.append(f"Risk: {risk}")
+
+    # Blind spots from coaching insights (0-20 points) - DANGEROUS
+    ci = student.get('coaching_insights', {})
+    blind_spots = len(ci.get('blind_spots', []))
+    blind_pts = min(blind_spots * 7, 20)
+    score += blind_pts
+    if blind_spots > 0:
+        factors.append(f"{blind_spots} blind spot(s)")
+
+    # Confirmed gaps (0-15 points)
+    confirmed_gaps = len(ci.get('confirmed_gaps', []))
+    gap_pts = min(confirmed_gaps * 5, 15)
+    score += gap_pts
+    if confirmed_gaps > 0:
+        factors.append(f"{confirmed_gaps} confirmed gap(s)")
+
+    # Distance from target (0-15 points)
+    predicted = student.get('predicted_score')
+    target = student.get('target_score')
+    pt_score = student.get('pt_score')
+    actual = pt_score or predicted
+    if actual and target:
+        gap = target - actual
+        if gap >= 3:
+            score += 15
+            factors.append(f"Target gap: {gap} points")
+        elif gap >= 2:
+            score += 10
+            factors.append(f"Target gap: {gap} points")
+        elif gap >= 1:
+            score += 5
+
+    # Coaching trajectory (0-10 points)
+    trajectory = ci.get('coaching_trajectory', 'unknown')
+    if trajectory == 'declining':
+        score += 10
+        factors.append("Declining trajectory")
+    elif trajectory == 'stable':
+        score += 3
+    elif trajectory == 'improving':
+        score += 0  # Good trajectory, less urgent
+
+    # Time pressure - late for PT deadline (0-10 points)
+    if student.get('late_for_pt'):
+        score += 10
+        factors.append("Behind schedule")
+
+    # FRQ weakness (0-10 points) - common critical gap
+    frq_accuracy = student.get('tb_frq_accuracy')
+    if frq_accuracy is not None and frq_accuracy < 60:
+        score += 8
+        factors.append(f"FRQ weak ({frq_accuracy:.0f}%)")
+    elif student.get('frq_weak'):
+        score += 6
+        factors.append("FRQ flagged")
+
+    # Neglected - no recent coaching (0-5 points)
+    patterns = student.get('coaching_patterns')
+    if not patterns or patterns.get('total_sessions', 0) == 0:
+        score += 5
+        factors.append("No coaching sessions yet")
+
+    # Low confidence despite need (0-5 points)
+    confidence = student.get('confidence')
+    if confidence is not None and confidence < 40 and risk in ('Critical', 'At Risk'):
+        score += 5
+        factors.append("Low confidence")
+
+    # Cap at 100
+    score = min(score, 100)
+
+    return {
+        'score': score,
+        'factors': factors,
+        'priority': 'Critical' if score >= 70 else 'High' if score >= 50 else 'Medium' if score >= 30 else 'Low'
+    }
+
+
+def generate_session_agenda(student):
+    """
+    Generate a coaching session agenda based on student's needs.
+    """
+    ci = student.get('coaching_insights', {})
+    survey = student.get('survey')
+    patterns = student.get('coaching_patterns')
+
+    agenda = {
+        'student': student.get('student'),
+        'course': student.get('course'),
+        'duration_min': 30,  # Default
+        'sections': []
+    }
+
+    # 1. Check-in (5 min)
+    checkin = {
+        'title': 'Check-in',
+        'duration': 5,
+        'content': ['How are you feeling about the exam?', 'Any wins or struggles since last time?']
+    }
+
+    # Add specific check-in items based on data
+    if patterns and patterns.get('pending_actions'):
+        checkin['content'].append(f"Follow up: {patterns['pending_actions'][0]}")
+    if survey and survey.get('worry'):
+        worry = survey['worry'][:80] + '...' if len(survey.get('worry', '')) > 80 else survey.get('worry', '')
+        checkin['content'].append(f"Check on worry: \"{worry}\"")
+
+    agenda['sections'].append(checkin)
+
+    # 2. Priority Focus (15-20 min)
+    priority_actions = ci.get('priority_actions', [])
+    focus = {
+        'title': 'Focus Area',
+        'duration': 15,
+        'content': []
+    }
+
+    # Add priority items
+    for pa in priority_actions[:3]:
+        action_type = pa.get('type', '')
+        action = pa.get('action', '')
+
+        if action_type == 'Blind Spot':
+            focus['content'].append(f"🔴 ADDRESS BLIND SPOT: {action}")
+        elif action_type == 'Confirmed Gap':
+            focus['content'].append(f"🟠 Work on gap: {action}")
+        elif action_type == 'Coach Observed':
+            focus['content'].append(f"🔵 Continue working on: {action}")
+        elif action_type == 'Reassurance':
+            focus['content'].append(f"🟢 Reassure: {action}")
+
+    # Add FRQ practice if needed
+    if student.get('frq_weak') or (student.get('tb_frq_accuracy') and student.get('tb_frq_accuracy') < 70):
+        focus['content'].append("📝 FRQ practice: Work through one question together")
+        focus['duration'] = 20
+
+    if not focus['content']:
+        focus['content'].append("Review recent progress and identify next focus area")
+
+    agenda['sections'].append(focus)
+
+    # 3. Practice/Application (5-10 min)
+    practice = {
+        'title': 'Practice',
+        'duration': 5,
+        'content': []
+    }
+
+    # Suggest specific practice based on gaps
+    weak_units = student.get('weak_units', [])
+    if weak_units:
+        unit = weak_units[0]
+        practice['content'].append(f"Quick review: {unit.get('unit_name', 'Weak unit')} concepts")
+
+    blind_spots = ci.get('blind_spots', [])
+    if blind_spots:
+        practice['content'].append(f"Reality check: Quiz on {blind_spots[0].get('area', 'blind spot area')}")
+
+    if not practice['content']:
+        practice['content'].append("Review a practice question or concept together")
+
+    agenda['sections'].append(practice)
+
+    # 4. Commitments (5 min)
+    commitments = {
+        'title': 'Commitments & Next Steps',
+        'duration': 5,
+        'content': [
+            'What will you complete before our next session?',
+            'Set specific, measurable goal'
+        ]
+    }
+
+    # Suggest based on need
+    recommendation = student.get('recommendation', '')
+    if recommendation == 'FRQ':
+        commitments['content'].append("Suggested: Complete 2 practice FRQs")
+    elif recommendation in ('Holes', 'Hole-Fill', 'Hole+FRQ'):
+        commitments['content'].append("Suggested: Review weak unit(s) on Austin Way")
+    elif recommendation == 'PT':
+        commitments['content'].append("Suggested: Take practice test")
+    elif recommendation == 'Stay':
+        commitments['content'].append("Suggested: Continue current pace")
+
+    agenda['sections'].append(commitments)
+
+    # Calculate total duration
+    agenda['duration_min'] = sum(s['duration'] for s in agenda['sections'])
+
+    return agenda
+
+
+def determine_primary_coaching_need(student):
+    """
+    Determine if a student's primary need is FRQ/essay skills or content gaps.
+    Returns 'frq' for essay/writing focus, 'content' for knowledge gaps.
+    """
+    ci = student.get('coaching_insights', {})
+
+    # Check for FRQ-related issues
+    frq_indicators = 0
+
+    # FRQ accuracy below threshold
+    if student.get('tb_frq_accuracy') is not None and student.get('tb_frq_accuracy') < 70:
+        frq_indicators += 2
+    if student.get('frq_weak'):
+        frq_indicators += 2
+
+    # Survey indicates FRQ concerns
+    survey = student.get('survey', {})
+    if survey:
+        frq_avg = survey.get('frq_avg')
+        if frq_avg is not None and frq_avg < 2.5:
+            frq_indicators += 2
+        # Check if worry mentions FRQ/essay/writing
+        worry = (survey.get('worry') or '').lower()
+        if any(x in worry for x in ['frq', 'essay', 'writing', 'thesis', 'evidence', 'dbq', 'leq', 'saq']):
+            frq_indicators += 1
+
+    # Check coaching insights for FRQ-related gaps
+    for gap in ci.get('confirmed_gaps', []):
+        if 'FRQ' in gap.get('area', ''):
+            frq_indicators += 2
+
+    # Check for content gaps
+    content_indicators = 0
+
+    # Unit-level blind spots or confirmed gaps
+    for item in ci.get('blind_spots', []) + ci.get('confirmed_gaps', []):
+        area = item.get('area', '')
+        if 'Unit' in area or 'Period' in area:
+            content_indicators += 1
+
+    # Weak units from quantitative data
+    weak_units = student.get('weak_units', [])
+    content_indicators += len(weak_units)
+
+    # Recommendation suggests content work
+    rec = student.get('recommendation', '')
+    if rec in ('Holes', 'Hole-Fill', 'Hole+FRQ'):
+        content_indicators += 2
+
+    # Determine primary need
+    if frq_indicators >= content_indicators and frq_indicators > 0:
+        return 'frq', frq_indicators, content_indicators
+    elif content_indicators > 0:
+        return 'content', frq_indicators, content_indicators
+    else:
+        return 'general', frq_indicators, content_indicators
+
+
+def calculate_coaching_plan(students, adam_hours=3, external_hours=2):
+    """
+    Generate a coaching plan that allocates time between two coaches:
+    - Adam: Focuses on FRQ/essay skills (LEQ, DBQ, thesis, evidence, etc.)
+    - External: Content specialist who handles knowledge gaps + overflow
+
+    Returns:
+    - Prioritized student list with coach assignments
+    - Utilization stats for both coaches
+    """
+    # Calculate need scores and determine primary coaching need
+    student_needs = []
+    for s in students:
+        need = calculate_coaching_need(s)
+        primary_need, frq_score, content_score = determine_primary_coaching_need(s)
+        student_needs.append({
+            **s,
+            'need_score': need['score'],
+            'need_factors': need['factors'],
+            'need_priority': need['priority'],
+            'agenda': generate_session_agenda(s),
+            'primary_need': primary_need,
+            'frq_need_score': frq_score,
+            'content_need_score': content_score
+        })
+
+    # Sort by need score (highest first)
+    student_needs.sort(key=lambda x: x['need_score'], reverse=True)
+
+    # Track allocation for both coaches
+    adam_available_min = adam_hours * 60
+    external_available_min = external_hours * 60
+    adam_allocated_min = 0
+    external_allocated_min = 0
+
+    allocated = []
+
+    for s in student_needs:
+        need = s['need_score']
+        priority = s['need_priority']
+        primary_need = s['primary_need']
+
+        # Determine session frequency and duration based on priority
+        if priority == 'Critical':
+            frequency = 'weekly'
+            session_min = 45
+            sessions_per_week = 1
+        elif priority == 'High':
+            frequency = 'weekly'
+            session_min = 30
+            sessions_per_week = 1
+        elif priority == 'Medium':
+            frequency = 'biweekly'
+            session_min = 30
+            sessions_per_week = 0.5
+        else:  # Low
+            frequency = 'monthly'
+            session_min = 20
+            sessions_per_week = 0.25
+
+        weekly_min = session_min * sessions_per_week
+
+        # Assign coach based on primary need and availability
+        # Adam handles FRQ/essay needs
+        # External handles content gaps + overflow
+        if primary_need == 'frq' and adam_allocated_min + weekly_min <= adam_available_min:
+            assigned_coach = 'Adam'
+            coach_focus = 'FRQ/Essay Skills'
+            adam_allocated_min += weekly_min
+        elif primary_need == 'content':
+            assigned_coach = 'External'
+            coach_focus = 'Content Gaps'
+            external_allocated_min += weekly_min
+        elif adam_allocated_min + weekly_min <= adam_available_min:
+            # General need, Adam has capacity
+            assigned_coach = 'Adam'
+            coach_focus = 'General Support'
+            adam_allocated_min += weekly_min
+        else:
+            # Overflow to external
+            assigned_coach = 'External'
+            coach_focus = 'Overflow' if primary_need != 'content' else 'Content Gaps'
+            external_allocated_min += weekly_min
+
+        allocated.append({
+            'student': s['student'],
+            'course': s['course'],
+            'need_score': need,
+            'need_priority': priority,
+            'need_factors': s['need_factors'],
+            'frequency': frequency,
+            'session_duration': session_min,
+            'weekly_minutes': weekly_min,
+            'agenda': s['agenda'],
+            'risk': s.get('risk'),
+            'pt_score': s.get('pt_score'),
+            'confidence': s.get('confidence'),
+            'recommendation': s.get('recommendation'),
+            'coaching_sessions': s.get('coaching_patterns', {}).get('total_sessions', 0) if s.get('coaching_patterns') else 0,
+            'assigned_coach': assigned_coach,
+            'coach_focus': coach_focus,
+            'primary_need': primary_need,
+            'frq_need_score': s['frq_need_score'],
+            'content_need_score': s['content_need_score']
+        })
+
+    # Calculate baseline utilization (before upgrades)
+    baseline_adam_min = adam_allocated_min
+    baseline_external_min = external_allocated_min
+
+    # =========================================================================
+    # SURPLUS ALLOCATION: Upgrade students if we have extra capacity
+    # =========================================================================
+    upgrades_made = []
+
+    def try_upgrade_student(student, coach_available, coach_allocated):
+        """Try to upgrade a student's session. Returns (new_allocated, upgrade_desc) or None."""
+        freq = student['frequency']
+        duration = student['session_duration']
+        current_weekly = student['weekly_minutes']
+
+        # Upgrade priority: frequency first, then duration
+        upgrade_options = []
+
+        # Frequency upgrades
+        if freq == 'monthly':
+            # monthly (0.25/wk) -> biweekly (0.5/wk)
+            new_weekly = duration * 0.5
+            extra_needed = new_weekly - current_weekly
+            if coach_allocated + extra_needed <= coach_available:
+                upgrade_options.append({
+                    'frequency': 'biweekly',
+                    'sessions_per_week': 0.5,
+                    'session_duration': duration,
+                    'weekly_minutes': new_weekly,
+                    'extra': extra_needed,
+                    'desc': f"Monthly → Biweekly (+{extra_needed:.0f} min/wk)"
+                })
+
+        if freq == 'biweekly':
+            # biweekly (0.5/wk) -> weekly (1/wk)
+            new_weekly = duration * 1
+            extra_needed = new_weekly - current_weekly
+            if coach_allocated + extra_needed <= coach_available:
+                upgrade_options.append({
+                    'frequency': 'weekly',
+                    'sessions_per_week': 1,
+                    'session_duration': duration,
+                    'weekly_minutes': new_weekly,
+                    'extra': extra_needed,
+                    'desc': f"Biweekly → Weekly (+{extra_needed:.0f} min/wk)"
+                })
+
+        # Duration upgrades (only for weekly sessions)
+        if freq == 'weekly':
+            if duration == 20:
+                new_weekly = 30 * 1
+                extra_needed = new_weekly - current_weekly
+                if coach_allocated + extra_needed <= coach_available:
+                    upgrade_options.append({
+                        'frequency': 'weekly',
+                        'sessions_per_week': 1,
+                        'session_duration': 30,
+                        'weekly_minutes': new_weekly,
+                        'extra': extra_needed,
+                        'desc': f"20min → 30min sessions (+{extra_needed:.0f} min/wk)"
+                    })
+            elif duration == 30:
+                new_weekly = 45 * 1
+                extra_needed = new_weekly - current_weekly
+                if coach_allocated + extra_needed <= coach_available:
+                    upgrade_options.append({
+                        'frequency': 'weekly',
+                        'sessions_per_week': 1,
+                        'session_duration': 45,
+                        'weekly_minutes': new_weekly,
+                        'extra': extra_needed,
+                        'desc': f"30min → 45min sessions (+{extra_needed:.0f} min/wk)"
+                    })
+            elif duration == 45:
+                new_weekly = 60 * 1
+                extra_needed = new_weekly - current_weekly
+                if coach_allocated + extra_needed <= coach_available:
+                    upgrade_options.append({
+                        'frequency': 'weekly',
+                        'sessions_per_week': 1,
+                        'session_duration': 60,
+                        'weekly_minutes': new_weekly,
+                        'extra': extra_needed,
+                        'desc': f"45min → 60min sessions (+{extra_needed:.0f} min/wk)"
+                    })
+
+        # Return the best upgrade (frequency upgrades prioritized by being first)
+        if upgrade_options:
+            return upgrade_options[0]
+        return None
+
+    # Keep upgrading until we can't anymore
+    # Prioritize by need_score (highest first) - already sorted
+    made_upgrade = True
+    while made_upgrade:
+        made_upgrade = False
+
+        # Try Adam's students first
+        adam_students = [s for s in allocated if s['assigned_coach'] == 'Adam']
+        adam_students.sort(key=lambda x: x['need_score'], reverse=True)
+
+        for student in adam_students:
+            upgrade = try_upgrade_student(student, adam_available_min, adam_allocated_min)
+            if upgrade:
+                # Apply upgrade
+                student['frequency'] = upgrade['frequency']
+                student['session_duration'] = upgrade['session_duration']
+                student['weekly_minutes'] = upgrade['weekly_minutes']
+                student['upgraded'] = True
+                student['upgrade_desc'] = upgrade['desc']
+                adam_allocated_min += upgrade['extra']
+                upgrades_made.append({
+                    'student': student['student'],
+                    'coach': 'Adam',
+                    'upgrade': upgrade['desc']
+                })
+                made_upgrade = True
+                break  # Re-sort and try again
+
+        if made_upgrade:
+            continue
+
+        # Try External's students
+        external_students = [s for s in allocated if s['assigned_coach'] == 'External']
+        external_students.sort(key=lambda x: x['need_score'], reverse=True)
+
+        for student in external_students:
+            upgrade = try_upgrade_student(student, external_available_min, external_allocated_min)
+            if upgrade:
+                # Apply upgrade
+                student['frequency'] = upgrade['frequency']
+                student['session_duration'] = upgrade['session_duration']
+                student['weekly_minutes'] = upgrade['weekly_minutes']
+                student['upgraded'] = True
+                student['upgrade_desc'] = upgrade['desc']
+                external_allocated_min += upgrade['extra']
+                upgrades_made.append({
+                    'student': student['student'],
+                    'coach': 'External',
+                    'upgrade': upgrade['desc']
+                })
+                made_upgrade = True
+                break
+
+    # Calculate final utilization
+    adam_utilization = (adam_allocated_min / adam_available_min * 100) if adam_available_min > 0 else 0
+    external_utilization = (external_allocated_min / external_available_min * 100) if external_available_min > 0 else 0
+    total_needed = adam_allocated_min + external_allocated_min
+    total_available = adam_available_min + external_available_min
+    total_utilization = (total_needed / total_available * 100) if total_available > 0 else 0
+
+    # Calculate minimum hours needed (baseline before upgrades)
+    baseline_total = baseline_adam_min + baseline_external_min
+    minimum_hours_needed = round(baseline_total / 60, 1)
+
+    # Calculate shortage
+    hours_short = max(0, minimum_hours_needed - (adam_hours + external_hours))
+    adam_hours_short = max(0, round((baseline_adam_min - adam_available_min) / 60, 1))
+    external_hours_short = max(0, round((baseline_external_min - external_available_min) / 60, 1))
+
+    # Count by priority
+    priority_counts = {
+        'Critical': len([a for a in allocated if a['need_priority'] == 'Critical']),
+        'High': len([a for a in allocated if a['need_priority'] == 'High']),
+        'Medium': len([a for a in allocated if a['need_priority'] == 'Medium']),
+        'Low': len([a for a in allocated if a['need_priority'] == 'Low'])
+    }
+
+    # Count by coach
+    coach_counts = {
+        'Adam': len([a for a in allocated if a['assigned_coach'] == 'Adam']),
+        'External': len([a for a in allocated if a['assigned_coach'] == 'External'])
+    }
+
+    # Identify common skill gaps
+    common_gaps = []
+    frq_weak_count = sum(1 for s in student_needs if s.get('frq_weak') or (s.get('tb_frq_accuracy') and s.get('tb_frq_accuracy', 100) < 70))
+    if frq_weak_count >= 3:
+        common_gaps.append({'gap': 'FRQ Skills', 'count': frq_weak_count, 'suggestion': 'Adam could run group FRQ workshop'})
+
+    content_gap_count = sum(1 for s in student_needs if len(s.get('weak_units', [])) > 0)
+    if content_gap_count >= 3:
+        common_gaps.append({'gap': 'Content Gaps', 'count': content_gap_count, 'suggestion': 'External coach focus area'})
+
+    # Check capacity status
+    under_capacity = hours_short > 0
+    need_more_external = external_hours_short > 0
+    need_more_adam = adam_hours_short > 0
+
+    return {
+        'students': allocated,
+        'summary': {
+            'total_students': len(allocated),
+            'priority_counts': priority_counts,
+            'coach_counts': coach_counts,
+            'common_gaps': common_gaps,
+            # Adam stats
+            'adam_hours': adam_hours,
+            'adam_allocated': round(adam_allocated_min / 60, 1),
+            'adam_utilization': round(adam_utilization, 0),
+            'adam_hours_short': adam_hours_short,
+            # External stats
+            'external_hours': external_hours,
+            'external_allocated': round(external_allocated_min / 60, 1),
+            'external_utilization': round(external_utilization, 0),
+            'external_hours_short': external_hours_short,
+            # Combined stats
+            'total_hours': adam_hours + external_hours,
+            'total_allocated': round(total_needed / 60, 1),
+            'total_utilization': round(total_utilization, 0),
+            # Capacity info
+            'minimum_hours_needed': minimum_hours_needed,
+            'hours_short': hours_short,
+            'under_capacity': under_capacity,
+            # Upgrades made
+            'upgrades_made': upgrades_made,
+            'upgrade_count': len(upgrades_made),
+            # Alerts
+            'need_more_external': need_more_external,
+            'need_more_adam': need_more_adam
+        }
+    }
+
 
 # =============================================================================
 # SLACK INTEGRATION
@@ -793,6 +2085,9 @@ def load_all_data():
     else:
         aw_daily_raw = pd.DataFrame()
 
+    # 6. Self-assessment survey data
+    surveys = load_self_assessment_data()
+
     return {
         'tracker': tracker_students,
         'practice': practice_recent,
@@ -801,7 +2096,8 @@ def load_all_data():
         'aw_activity': aw_activity,
         'aw_daily_raw': aw_daily_raw,
         'timeback': timeback_data,
-        'lesson_details': lesson_details
+        'lesson_details': lesson_details,
+        'surveys': surveys
     }
 
 
@@ -1449,6 +2745,7 @@ def build_unified_table(data):
     aw_daily_raw = data['aw_daily_raw']
     timeback = data['timeback']
     lesson_details = data['lesson_details']
+    surveys = data.get('surveys', {})
 
     if len(tracker) == 0:
         return []
@@ -1648,6 +2945,9 @@ def build_unified_table(data):
         tb_from_units = sum(ud['timeback'] for ud in ced_units) / len(ced_units) if ced_units else 0
         aw_from_units = sum(ud['austin_way'] for ud in ced_units) / len(ced_units) if ced_units else 0
 
+        # Get self-assessment survey data
+        survey = get_student_survey(surveys, student_name, course)
+
         rows.append({
             'student': student_name,
             'student_id': student_id,
@@ -1684,6 +2984,11 @@ def build_unified_table(data):
             'tb_mcq_accuracy': test_perf.get('mcq_accuracy'),
             'tb_frq_accuracy': test_perf.get('frq_accuracy'),
             'frq_weak': test_perf.get('frq_weak', False),
+            # Self-assessment survey data
+            'survey': survey,
+            'confidence': survey.get('confidence') if survey else None,
+            'predicted_score': survey.get('predicted_score') if survey else None,
+            'target_score': survey.get('target_score') if survey else None,
         })
 
         # Add locked recommendation and progress delta
@@ -1697,6 +3002,13 @@ def build_unified_table(data):
             rows[-1]['locked_recommendation'] = None
             rows[-1]['locked_rec_detail'] = None
             rows[-1]['progress_vs_last_week'] = None
+
+        # Get coaching notes and patterns
+        rows[-1]['coaching_notes'] = get_student_notes(student_name, course, limit=3)
+        rows[-1]['coaching_patterns'] = get_coaching_patterns(student_name, course)
+
+        # Generate unified coaching insights (triangulating survey + quantitative data + coaching notes)
+        rows[-1]['coaching_insights'] = generate_coaching_insights(rows[-1])
 
     return rows
 
@@ -2254,6 +3566,7 @@ DASHBOARD_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
@@ -2332,6 +3645,7 @@ DASHBOARD_HTML = '''
                 <th data-sort="course">Course</th>
                 <th data-sort="risk">Risk</th>
                 <th data-sort="pt_score">PT</th>
+                <th data-sort="confidence">Confidence</th>
                 <th data-sort="timeback_progress">Timeback</th>
                 <th data-sort="aw_mastery">Austin Way</th>
                 <th data-sort="combined_progress">Combined</th>
@@ -2355,6 +3669,9 @@ DASHBOARD_HTML = '''
                     {% else %}
                     <span class="metric-null">—</span>
                     {% endif %}
+                </td>
+                <td class="metric {% if s.confidence and s.confidence >= 67 %}metric-good{% elif s.confidence and s.confidence >= 33 %}metric-ok{% elif s.confidence is not none %}metric-bad{% else %}metric-null{% endif %}">
+                    {% if s.confidence is not none %}{{ s.confidence }}%{% else %}<span class="metric-null">—</span>{% endif %}
                 </td>
                 <td class="metric {% if s.timeback_progress and s.timeback_progress >= 90 %}metric-good{% elif s.timeback_progress and s.timeback_progress >= 70 %}metric-ok{% elif s.timeback_progress %}metric-bad{% else %}metric-null{% endif %}">
                     {{ s.timeback_progress|default('—', true) }}{% if s.timeback_progress %}%{% endif %}
@@ -2454,7 +3771,7 @@ DASHBOARD_HTML = '''
         });
 
         function getColumnIndex(column) {
-            const columns = ['student', 'course', 'risk', 'pt_score', 'timeback_progress', 'aw_mastery', 'combined_progress', 'xp_to_90', 'projected_90', 'recommendation', 'daily_xp'];
+            const columns = ['student', 'course', 'risk', 'pt_score', 'confidence', 'timeback_progress', 'aw_mastery', 'combined_progress', 'progress_vs_last_week', 'xp_to_90', 'projected_90', 'locked_recommendation', 'recommendation', 'daily_xp'];
             return columns.indexOf(column);
         }
 
@@ -2728,6 +4045,7 @@ STUDENT_HTML = '''
 <body>
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/settings">Settings</a>
@@ -2925,6 +4243,831 @@ STUDENT_HTML = '''
         </p>
     </div>
     {% endif %}
+
+    {# Unified Coaching Insights Section - Triangulates Survey + Quantitative Data #}
+    {% if student.coaching_insights %}
+    {% set ci = student.coaching_insights %}
+    <div class="chart-container" style="border-left: 4px solid #4da6ff;">
+        <div class="chart-title" style="color: #4da6ff;">
+            Coaching Insights {% if student.survey %}(Data + Self-Assessment){% else %}(Data Only){% endif %}
+        </div>
+
+        {# Priority Actions - Most Important #}
+        {% if ci.priority_actions %}
+        <div style="margin: 15px 0;">
+            <p style="color: #fff; font-weight: bold; margin-bottom: 10px;">Priority Actions:</p>
+            {% for action in ci.priority_actions %}
+            <div style="background: #1a1a2e; padding: 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid {% if action.type == 'Blind Spot' %}#ff4444{% elif action.type == 'Confirmed Gap' %}#ff8844{% elif action.type == 'Mindset' %}#aa88ff{% else %}#44ff44{% endif %};">
+                <span style="color: {% if action.type == 'Blind Spot' %}#ff4444{% elif action.type == 'Confirmed Gap' %}#ff8844{% elif action.type == 'Mindset' %}#aa88ff{% else %}#44ff44{% endif %}; font-weight: bold;">{{ action.type }}</span>
+                <span style="color: #ccc; margin-left: 10px;">{{ action.action }}</span>
+                <div style="color: #666; font-size: 11px; margin-top: 4px;">{{ action.source }}</div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {# Blind Spots - High Priority #}
+        {% if ci.blind_spots %}
+        <div style="margin-top: 20px;">
+            <p style="color: #ff4444; font-weight: bold; margin-bottom: 10px;">
+                Blind Spots (Confident but Data Shows Weakness)
+            </p>
+            <div style="display: grid; gap: 10px;">
+                {% for bs in ci.blind_spots %}
+                <div style="background: #2d1a1a; padding: 12px; border-radius: 6px; border: 1px solid #ff4444;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="color: #ff4444; font-weight: bold;">{{ bs.area }}</span>
+                        <span style="color: #888; font-size: 12px;">{{ bs.detail[:30] }}{% if bs.detail|length > 30 %}...{% endif %}</span>
+                    </div>
+                    <div style="display: flex; gap: 20px; margin-top: 8px; font-size: 13px;">
+                        <span style="color: #ffaa00;">Self: {{ bs.self_rating }}</span>
+                        <span style="color: #ff4444;">Data: {{ bs.actual }}</span>
+                    </div>
+                    <div style="color: #ccc; font-size: 12px; margin-top: 6px;">{{ bs.action }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {# Confirmed Gaps - Both Sources Agree #}
+        {% if ci.confirmed_gaps %}
+        <div style="margin-top: 20px;">
+            <p style="color: #ff8844; font-weight: bold; margin-bottom: 10px;">
+                Confirmed Gaps (Both Student and Data Agree)
+            </p>
+            <div style="display: grid; gap: 10px;">
+                {% for cg in ci.confirmed_gaps %}
+                <div style="background: #2d2a1a; padding: 12px; border-radius: 6px; border: 1px solid #ff8844;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="color: #ff8844; font-weight: bold;">{{ cg.area }}</span>
+                    </div>
+                    <div style="display: flex; gap: 20px; margin-top: 8px; font-size: 13px;">
+                        <span style="color: #ffaa00;">Self: {{ cg.self_rating }}</span>
+                        <span style="color: #ff8844;">Data: {{ cg.actual }}</span>
+                    </div>
+                    <div style="color: #ccc; font-size: 12px; margin-top: 6px;">{{ cg.action }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {# False Worries - Reassurance Needed #}
+        {% if ci.false_worries %}
+        <div style="margin-top: 20px;">
+            <p style="color: #44ff44; font-weight: bold; margin-bottom: 10px;">
+                False Worries (Worried but Data Shows Strength)
+            </p>
+            <div style="display: grid; gap: 10px;">
+                {% for fw in ci.false_worries %}
+                <div style="background: #1a2d1a; padding: 12px; border-radius: 6px; border: 1px solid #44ff44;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="color: #44ff44; font-weight: bold;">{{ fw.area }}</span>
+                    </div>
+                    <div style="display: flex; gap: 20px; margin-top: 8px; font-size: 13px;">
+                        <span style="color: #ffaa00;">Self: {{ fw.self_rating }}</span>
+                        <span style="color: #44ff44;">Data: {{ fw.actual }}</span>
+                    </div>
+                    <div style="color: #ccc; font-size: 12px; margin-top: 6px;">{{ fw.action }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {# Data-Only Gaps (No Survey) #}
+        {% if ci.data_only_gaps %}
+        <div style="margin-top: 20px;">
+            <p style="color: #ffaa00; font-weight: bold; margin-bottom: 10px;">
+                Data-Identified Gaps (No Self-Assessment Available)
+            </p>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                {% for dg in ci.data_only_gaps %}
+                <span style="background: #2d2a1a; color: #ffaa00; padding: 6px 12px; border-radius: 4px; font-size: 12px;">
+                    {{ dg.area }}: {{ dg.actual }}
+                </span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {# Insights from Coaching Notes #}
+        {% if ci.from_coaching %}
+        <div style="margin-top: 20px;">
+            <p style="color: #44dddd; font-weight: bold; margin-bottom: 10px;">
+                From Coaching Sessions ({{ ci.coaching_sessions }} sessions)
+                {% if ci.coaching_trajectory %}
+                <span style="margin-left: 10px; font-size: 12px; color: {% if ci.coaching_trajectory == 'improving' %}#44ff44{% elif ci.coaching_trajectory == 'declining' %}#ff4444{% else %}#888{% endif %};">
+                    Trajectory: {{ ci.coaching_trajectory }}
+                </span>
+                {% endif %}
+            </p>
+            <div style="display: grid; gap: 8px;">
+                {% for item in ci.from_coaching %}
+                <div style="background: #1a2d2d; padding: 10px; border-radius: 6px; border-left: 3px solid {% if item.type == 'Recurring Concern' %}#ff8844{% elif item.type == 'Action Item' %}#4da6ff{% else %}#44ff44{% endif %};">
+                    <span style="color: {% if item.type == 'Recurring Concern' %}#ff8844{% elif item.type == 'Action Item' %}#4da6ff{% else %}#44ff44{% endif %}; font-weight: bold; font-size: 11px;">{{ item.type }}</span>
+                    <span style="color: #ccc; margin-left: 8px;">{{ item.detail }}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {# Self-Assessment Details (if survey exists) #}
+    {% if student.survey %}
+    <div class="chart-container" style="border-left: 4px solid #888;">
+        <div class="chart-title" style="color: #888;">
+            Self-Assessment Details
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; margin: 15px 0;">
+            <div style="background: #1a1a2e; padding: 10px; border-radius: 6px; text-align: center;">
+                <div style="font-size: 20px; font-weight: bold; color: {% if student.confidence >= 67 %}#44ff44{% elif student.confidence >= 33 %}#ffaa00{% else %}#ff4444{% endif %};">
+                    {{ student.confidence }}%
+                </div>
+                <div style="font-size: 10px; color: #888;">Confidence</div>
+            </div>
+            <div style="background: #1a1a2e; padding: 10px; border-radius: 6px; text-align: center;">
+                <div style="font-size: 20px; font-weight: bold; color: {% if student.predicted_score and student.predicted_score >= 4 %}#44ff44{% elif student.predicted_score and student.predicted_score >= 3 %}#ffaa00{% else %}#ff4444{% endif %};">
+                    {{ student.predicted_score|default('—') }}
+                </div>
+                <div style="font-size: 10px; color: #888;">Predicted</div>
+            </div>
+            <div style="background: #1a1a2e; padding: 10px; border-radius: 6px; text-align: center;">
+                <div style="font-size: 20px; font-weight: bold; color: #4da6ff;">
+                    {{ student.target_score|default('—') }}
+                </div>
+                <div style="font-size: 10px; color: #888;">Target</div>
+            </div>
+            {% if student.survey.unit_avg %}
+            <div style="background: #1a1a2e; padding: 10px; border-radius: 6px; text-align: center;">
+                <div style="font-size: 20px; font-weight: bold; color: {% if student.survey.unit_avg >= 3 %}#44ff44{% elif student.survey.unit_avg >= 2 %}#ffaa00{% else %}#ff4444{% endif %};">
+                    {{ student.survey.unit_avg }}/4
+                </div>
+                <div style="font-size: 10px; color: #888;">Content</div>
+            </div>
+            {% endif %}
+            {% if student.survey.frq_avg %}
+            <div style="background: #1a1a2e; padding: 10px; border-radius: 6px; text-align: center;">
+                <div style="font-size: 20px; font-weight: bold; color: {% if student.survey.frq_avg >= 3 %}#44ff44{% elif student.survey.frq_avg >= 2 %}#ffaa00{% else %}#ff4444{% endif %};">
+                    {{ student.survey.frq_avg }}/4
+                </div>
+                <div style="font-size: 10px; color: #888;">FRQ</div>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if student.survey.worry and student.survey.worry not in ['n/a', 'N/A', 'no', 'No', 'None', ''] %}
+        <div style="margin-top: 15px; padding: 12px; background: #1a1a2e; border-radius: 8px;">
+            <p style="color: #ff8844; font-weight: bold; font-size: 12px;">Biggest worry:</p>
+            <p style="color: #ccc; margin-top: 4px; font-style: italic; font-size: 13px;">"{{ student.survey.worry }}"</p>
+        </div>
+        {% endif %}
+
+        {% if student.survey.help_needed and student.survey.help_needed not in ['n/a', 'N/A', 'no', 'No', 'None', '', 'Not necessarily. I just want help with my FRQ coaching. '] %}
+        <div style="margin-top: 10px; padding: 12px; background: #1a1a2e; border-radius: 8px;">
+            <p style="color: #4da6ff; font-weight: bold; font-size: 12px;">Help requested:</p>
+            <p style="color: #ccc; margin-top: 4px; font-style: italic; font-size: 13px;">"{{ student.survey.help_needed }}"</p>
+        </div>
+        {% endif %}
+
+        {% if student.survey.other and student.survey.other not in ['n/a', 'N/A', 'no', 'No', 'None', '', 'Nothing other than I just need help with my FRQs. '] %}
+        <div style="margin-top: 10px; padding: 12px; background: #1a1a2e; border-radius: 8px;">
+            <p style="color: #888; font-weight: bold; font-size: 12px;">Additional notes:</p>
+            <p style="color: #ccc; margin-top: 4px; font-style: italic; font-size: 13px;">"{{ student.survey.other }}"</p>
+        </div>
+        {% endif %}
+
+        <p style="color: #555; font-size: 10px; margin-top: 10px;">Survey: {{ student.survey.timestamp }}</p>
+    </div>
+    {% endif %}
+
+    {# Coaching Notes Section #}
+    <div class="chart-container" style="border-left: 4px solid #44dddd;">
+        <div class="chart-title" style="color: #44dddd;">
+            Coaching Notes
+            {% if student.coaching_patterns %}
+            <span style="font-size: 12px; font-weight: normal; color: #888; margin-left: 10px;">
+                {{ student.coaching_patterns.total_sessions }} session(s)
+            </span>
+            {% endif %}
+        </div>
+
+        {# Add New Note Form #}
+        <div style="margin: 15px 0; padding: 15px; background: #1a1a2e; border-radius: 8px;">
+            <p style="color: #888; font-size: 12px; margin-bottom: 10px;">Add coaching call notes:</p>
+            <textarea id="new-notes" rows="4" style="width: 100%; padding: 10px; background: #252540; border: 1px solid #444; border-radius: 4px; color: #fff; font-family: inherit; font-size: 13px; resize: vertical;" placeholder="Enter notes from your coaching call...&#10;&#10;Example: Worked on FRQ structure today. Student understands the thesis format but struggles to find specific evidence quickly. Assigned 2 practice FRQs for this week. Mood was positive, feeling more confident about MCQs."></textarea>
+            <div style="display: flex; gap: 10px; margin-top: 10px; align-items: center;">
+                <input type="date" id="call-date" style="padding: 8px; background: #252540; border: 1px solid #444; border-radius: 4px; color: #fff;" value="{{ today }}">
+                <button onclick="submitCoachingNote()" style="padding: 8px 16px; background: #44dddd; color: #1a1a2e; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Save Note</button>
+                <span id="save-status" style="color: #888; font-size: 12px;"></span>
+            </div>
+        </div>
+
+        {# Recent Notes History #}
+        {% if student.coaching_notes %}
+        <div style="margin-top: 20px;">
+            <p style="color: #888; font-weight: bold; margin-bottom: 10px;">Recent Notes:</p>
+            {% for note in student.coaching_notes %}
+            <div style="background: #1a1a2e; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <span style="color: #44dddd; font-weight: bold;">{{ note.date }}</span>
+                    {% if note.extracted.sentiment %}
+                    <span style="padding: 2px 8px; border-radius: 3px; font-size: 11px; background: {% if note.extracted.sentiment == 'strong' %}#1a3d1a{% elif note.extracted.sentiment == 'improving' %}#2d3d1a{% elif note.extracted.sentiment == 'struggling' %}#3d1a1a{% else %}#2d2d2d{% endif %}; color: {% if note.extracted.sentiment == 'strong' %}#44ff44{% elif note.extracted.sentiment == 'improving' %}#88cc44{% elif note.extracted.sentiment == 'struggling' %}#ff4444{% else %}#888{% endif %};">
+                        {{ note.extracted.sentiment }}
+                    </span>
+                    {% endif %}
+                </div>
+
+                {% if note.extracted.summary %}
+                <p style="color: #ccc; margin-bottom: 10px; font-size: 13px;">{{ note.extracted.summary }}</p>
+                {% endif %}
+
+                {% if note.extracted.themes %}
+                <div style="margin-bottom: 8px;">
+                    <span style="color: #888; font-size: 11px;">Themes:</span>
+                    {% for theme in note.extracted.themes %}
+                    <span style="background: #252540; color: #4da6ff; padding: 2px 8px; border-radius: 3px; font-size: 11px; margin-left: 5px;">{{ theme }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if note.extracted.action_items %}
+                <div style="margin-bottom: 8px;">
+                    <span style="color: #888; font-size: 11px;">Actions:</span>
+                    {% for action in note.extracted.action_items %}
+                    <div style="color: #ffaa00; font-size: 12px; margin-left: 10px;">• {{ action }}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if note.extracted.concerns %}
+                <div style="margin-bottom: 8px;">
+                    <span style="color: #888; font-size: 11px;">Concerns:</span>
+                    {% for concern in note.extracted.concerns %}
+                    <div style="color: #ff8844; font-size: 12px; margin-left: 10px;">• {{ concern }}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if note.extracted.strengths %}
+                <div style="margin-bottom: 8px;">
+                    <span style="color: #888; font-size: 11px;">Strengths:</span>
+                    {% for strength in note.extracted.strengths %}
+                    <div style="color: #44ff44; font-size: 12px; margin-left: 10px;">• {{ strength }}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                <details style="margin-top: 10px;">
+                    <summary style="color: #666; font-size: 11px; cursor: pointer;">View raw notes</summary>
+                    <p style="color: #888; font-size: 12px; margin-top: 8px; white-space: pre-wrap; background: #0d0d1a; padding: 10px; border-radius: 4px;">{{ note.raw_notes }}</p>
+                </details>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p style="color: #666; font-size: 13px; margin-top: 15px;">No coaching notes yet. Add notes after your coaching calls to track progress and patterns.</p>
+        {% endif %}
+    </div>
+
+    <script>
+    function submitCoachingNote() {
+        const notes = document.getElementById('new-notes').value.trim();
+        const date = document.getElementById('call-date').value;
+        const status = document.getElementById('save-status');
+
+        if (!notes) {
+            status.textContent = 'Please enter some notes';
+            status.style.color = '#ff4444';
+            return;
+        }
+
+        status.textContent = 'Saving...';
+        status.style.color = '#888';
+
+        fetch('/api/coaching-notes/{{ student.student|urlencode }}/{{ student.course }}', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({notes: notes, date: date})
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                status.textContent = 'Saved! Refreshing...';
+                status.style.color = '#44ff44';
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                status.textContent = data.error || 'Error saving';
+                status.style.color = '#ff4444';
+            }
+        })
+        .catch(err => {
+            status.textContent = 'Error: ' + err;
+            status.style.color = '#ff4444';
+        });
+    }
+    </script>
+</body>
+</html>
+'''
+
+PLANNER_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Coaching Planner</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 5px; color: #fff; }
+        h2 { margin: 20px 0 10px; color: #fff; font-size: 18px; }
+        .subtitle { color: #888; margin-bottom: 20px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { color: #4da6ff; margin-right: 20px; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .summary-card {
+            background: #252540;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .summary-value { font-size: 28px; font-weight: bold; }
+        .summary-label { color: #888; font-size: 12px; margin-top: 5px; }
+
+        .alert-box {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .alert-warning { background: #3d2a1a; border-left: 4px solid #ff8844; }
+        .alert-success { background: #1a3d1a; border-left: 4px solid #44ff44; }
+        .alert-info { background: #1a2a3d; border-left: 4px solid #4da6ff; }
+
+        .settings-form {
+            background: #252540;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .settings-form input {
+            padding: 8px;
+            background: #1a1a2e;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            width: 80px;
+        }
+        .settings-form button {
+            padding: 8px 16px;
+            background: #4da6ff;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .student-card {
+            background: #252540;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border-left: 4px solid #444;
+        }
+        .student-card.priority-Critical { border-left-color: #ff4444; }
+        .student-card.priority-High { border-left-color: #ff8844; }
+        .student-card.priority-Medium { border-left-color: #ffaa00; }
+        .student-card.priority-Low { border-left-color: #44ff44; }
+
+        .student-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .student-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .student-name a { color: #fff; text-decoration: none; }
+        .student-name a:hover { color: #4da6ff; }
+
+        .badge {
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .badge-critical { background: #ff4444; color: #fff; }
+        .badge-high { background: #ff8844; color: #fff; }
+        .badge-medium { background: #ffaa00; color: #1a1a2e; }
+        .badge-low { background: #44ff44; color: #1a1a2e; }
+
+        .student-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 13px;
+            color: #888;
+            margin-bottom: 10px;
+        }
+
+        .factors {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        .factor {
+            background: #1a1a2e;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            color: #ff8844;
+        }
+
+        .allocation {
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 10px;
+        }
+        .allocation-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .agenda {
+            margin-top: 10px;
+        }
+        .agenda-section {
+            padding: 8px;
+            margin: 5px 0;
+            background: #1a1a2e;
+            border-radius: 4px;
+            border-left: 3px solid #4da6ff;
+        }
+        .agenda-title {
+            font-weight: bold;
+            font-size: 12px;
+            color: #4da6ff;
+            margin-bottom: 5px;
+        }
+        .agenda-item {
+            font-size: 12px;
+            color: #ccc;
+            margin-left: 10px;
+        }
+
+        details summary {
+            cursor: pointer;
+            color: #4da6ff;
+            font-size: 13px;
+        }
+        details summary:hover {
+            text-decoration: underline;
+        }
+
+        .priority-filter {
+            margin-bottom: 15px;
+        }
+        .priority-filter button {
+            padding: 6px 12px;
+            margin-right: 8px;
+            background: #252540;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #888;
+            cursor: pointer;
+        }
+        .priority-filter button.active {
+            background: #4da6ff;
+            color: #fff;
+            border-color: #4da6ff;
+        }
+
+        .coach-filter {
+            margin-bottom: 15px;
+        }
+        .coach-filter button {
+            padding: 6px 12px;
+            margin-right: 8px;
+            background: #252540;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #888;
+            cursor: pointer;
+        }
+        .coach-filter button.active {
+            color: #fff;
+            border-color: #4da6ff;
+        }
+        .coach-filter button.active-adam {
+            background: #1a3d5c;
+            border-color: #4da6ff;
+        }
+        .coach-filter button.active-external {
+            background: #1a4d4d;
+            border-color: #44dddd;
+        }
+
+        .coach-badge {
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+        .coach-adam {
+            background: #1a3d5c;
+            color: #4da6ff;
+            border: 1px solid #4da6ff;
+        }
+        .coach-external {
+            background: #1a4d4d;
+            color: #44dddd;
+            border: 1px solid #44dddd;
+        }
+        .coach-focus {
+            font-size: 11px;
+            color: #888;
+            font-weight: normal;
+        }
+    </style>
+</head>
+<body>
+    <nav class="nav">
+        <a href="/">Dashboard</a>
+        <a href="/planner" style="font-weight: bold;">Planner</a>
+        <a href="/coaching">Coaching</a>
+        <a href="/comms">Communications</a>
+        <a href="/settings">Settings</a>
+    </nav>
+
+    <h1>Coaching Planner</h1>
+    <p class="subtitle">Prioritize students and allocate coaching time by skill</p>
+
+    {# Settings - Two Coaches #}
+    <form class="settings-form" action="/planner/settings" method="POST" style="flex-wrap: wrap;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="color: #4da6ff; font-weight: bold;">Adam</span>
+            <span style="color: #888; font-size: 12px;">(FRQ/Essay)</span>
+            <input type="number" name="adam_hours" value="{{ adam_hours }}" step="0.5" min="0" max="20" style="width: 60px;">
+            <span style="color: #888;">h/wk</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="color: #44dddd; font-weight: bold;">External</span>
+            <span style="color: #888; font-size: 12px;">(Content Specialist)</span>
+            <input type="number" name="external_hours" value="{{ external_hours }}" step="0.5" min="0" max="20" style="width: 60px;">
+            <span style="color: #888;">h/wk</span>
+        </div>
+        <button type="submit">Update</button>
+    </form>
+
+    {# Summary Cards - By Coach #}
+    <div class="summary-grid">
+        <div class="summary-card">
+            <div class="summary-value">{{ plan.summary.total_students }}</div>
+            <div class="summary-label">Total Students</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-value" style="color: #ff4444;">{{ plan.summary.priority_counts.Critical }}</div>
+            <div class="summary-label">Critical</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-value" style="color: #ff8844;">{{ plan.summary.priority_counts.High }}</div>
+            <div class="summary-label">High</div>
+        </div>
+        <div class="summary-card" style="border-left: 3px solid #4da6ff;">
+            <div class="summary-value" style="color: #4da6ff;">{{ plan.summary.coach_counts.Adam }}</div>
+            <div class="summary-label">Adam's Students</div>
+            <div style="font-size: 11px; color: #888; margin-top: 5px;">{{ plan.summary.adam_allocated }}h / {{ plan.summary.adam_hours }}h</div>
+            <div style="font-size: 11px; color: {% if plan.summary.adam_utilization > 100 %}#ff4444{% elif plan.summary.adam_utilization > 80 %}#ffaa00{% else %}#44ff44{% endif %};">{{ plan.summary.adam_utilization|int }}% util</div>
+        </div>
+        <div class="summary-card" style="border-left: 3px solid #44dddd;">
+            <div class="summary-value" style="color: #44dddd;">{{ plan.summary.coach_counts.External }}</div>
+            <div class="summary-label">External's Students</div>
+            <div style="font-size: 11px; color: #888; margin-top: 5px;">{{ plan.summary.external_allocated }}h / {{ plan.summary.external_hours }}h</div>
+            <div style="font-size: 11px; color: {% if plan.summary.external_utilization > 100 %}#ff4444{% elif plan.summary.external_utilization > 80 %}#ffaa00{% else %}#44ff44{% endif %};">{{ plan.summary.external_utilization|int }}% util</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-value" style="color: {% if plan.summary.total_utilization > 100 %}#ff4444{% elif plan.summary.total_utilization > 80 %}#ffaa00{% else %}#44ff44{% endif %};">
+                {{ plan.summary.total_utilization|int }}%
+            </div>
+            <div class="summary-label">Total Utilization</div>
+            <div style="font-size: 11px; color: #888; margin-top: 5px;">{{ plan.summary.total_allocated }}h / {{ plan.summary.total_hours }}h</div>
+        </div>
+    </div>
+
+    {# BIG WARNING: Under Capacity #}
+    {% if plan.summary.under_capacity %}
+    <div style="background: linear-gradient(135deg, #5c1a1a 0%, #3d1a1a 100%); border: 3px solid #ff4444; border-radius: 12px; padding: 25px; margin-bottom: 25px; text-align: center;">
+        <div style="font-size: 48px; margin-bottom: 10px;">⚠️</div>
+        <div style="font-size: 24px; font-weight: bold; color: #ff6666; margin-bottom: 10px;">INSUFFICIENT COACHING HOURS</div>
+        <div style="font-size: 18px; color: #fff; margin-bottom: 15px;">
+            Need <strong>{{ plan.summary.minimum_hours_needed }}h/week</strong> minimum, but only <strong>{{ plan.summary.total_hours }}h/week</strong> available
+        </div>
+        <div style="font-size: 16px; color: #ffaaaa;">
+            Short by <strong>{{ "%.1f"|format(plan.summary.hours_short) }}h/week</strong>
+            {% if plan.summary.adam_hours_short > 0 and plan.summary.external_hours_short > 0 %}
+            (Adam: +{{ "%.1f"|format(plan.summary.adam_hours_short) }}h, External: +{{ "%.1f"|format(plan.summary.external_hours_short) }}h)
+            {% elif plan.summary.adam_hours_short > 0 %}
+            (Adam needs +{{ "%.1f"|format(plan.summary.adam_hours_short) }}h)
+            {% elif plan.summary.external_hours_short > 0 %}
+            (External needs +{{ "%.1f"|format(plan.summary.external_hours_short) }}h)
+            {% endif %}
+        </div>
+        <div style="margin-top: 15px; font-size: 13px; color: #ccc;">
+            Students are getting less coaching than their priority level requires. Consider adding hours or group sessions.
+        </div>
+    </div>
+    {% endif %}
+
+    {# Upgrades Made (surplus hours allocated) #}
+    {% if plan.summary.upgrade_count > 0 %}
+    <div class="alert-box alert-success" style="border-left-width: 4px;">
+        <strong style="color: #44ff44;">✨ Surplus Hours Allocated</strong><br>
+        <span style="color: #ccc;">{{ plan.summary.upgrade_count }} student(s) upgraded to improve outcomes:</span>
+        <div style="margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;">
+            {% for upgrade in plan.summary.upgrades_made[:10] %}
+            <span style="background: #1a3d1a; padding: 4px 10px; border-radius: 4px; font-size: 12px;">
+                <strong>{{ upgrade.student }}</strong>: {{ upgrade.upgrade }}
+            </span>
+            {% endfor %}
+            {% if plan.summary.upgrade_count > 10 %}
+            <span style="color: #888; font-size: 12px;">...and {{ plan.summary.upgrade_count - 10 }} more</span>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    {# Capacity Status (when not critically under) #}
+    {% if not plan.summary.under_capacity %}
+        {% if plan.summary.total_utilization > 90 %}
+        <div class="alert-box alert-info">
+            <strong>Near Capacity</strong><br>
+            <span style="color: #ccc;">{{ plan.summary.total_utilization|int }}% utilized. All students receiving minimum recommended coaching.</span>
+        </div>
+        {% elif plan.summary.upgrade_count == 0 %}
+        <div class="alert-box alert-success">
+            <strong>Capacity OK</strong><br>
+            <span style="color: #ccc;">Both coaches have sufficient capacity. All students at minimum levels.</span>
+        </div>
+        {% endif %}
+    {% endif %}
+
+    {# Common Gaps #}
+    {% if plan.summary.common_gaps %}
+    <div class="alert-box alert-info">
+        <strong>Common Skill Gaps Detected</strong><br>
+        {% for gap in plan.summary.common_gaps %}
+        <span style="color: #ccc;">{{ gap.gap }}: {{ gap.count }} high-need students. {{ gap.suggestion }}</span><br>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {# Coach Filter #}
+    <div class="coach-filter">
+        <strong style="color: #888; margin-right: 10px;">Coach:</strong>
+        <button class="active" onclick="filterCoach('all')">All ({{ plan.summary.total_students }})</button>
+        <button onclick="filterCoach('Adam')" style="color: #4da6ff;">Adam ({{ plan.summary.coach_counts.Adam }})</button>
+        <button onclick="filterCoach('External')" style="color: #44dddd;">External ({{ plan.summary.coach_counts.External }})</button>
+    </div>
+
+    {# Priority Filter #}
+    <div class="priority-filter">
+        <strong style="color: #888; margin-right: 10px;">Priority:</strong>
+        <button class="active" onclick="filterPriority('all')">All</button>
+        <button onclick="filterPriority('Critical')">Critical ({{ plan.summary.priority_counts.Critical }})</button>
+        <button onclick="filterPriority('High')">High ({{ plan.summary.priority_counts.High }})</button>
+        <button onclick="filterPriority('Medium')">Medium ({{ plan.summary.priority_counts.Medium }})</button>
+        <button onclick="filterPriority('Low')">Low ({{ plan.summary.priority_counts.Low }})</button>
+    </div>
+
+    <h2>Student Priorities</h2>
+
+    {# Student Cards #}
+    {% for s in plan.students %}
+    <div class="student-card priority-{{ s.need_priority }}" data-priority="{{ s.need_priority }}" data-coach="{{ s.assigned_coach }}">
+        <div class="student-header">
+            <div class="student-name">
+                <a href="/student/{{ s.student|urlencode }}/{{ s.course }}">{{ s.student }}</a>
+                <span style="color: #888; font-weight: normal; font-size: 13px; margin-left: 8px;">{{ s.course }}</span>
+                <span class="coach-badge coach-{{ s.assigned_coach|lower }}">{{ s.assigned_coach }}</span>
+                <span class="coach-focus">{{ s.coach_focus }}</span>
+            </div>
+            <div>
+                <span class="badge badge-{{ s.need_priority|lower }}">{{ s.need_priority }}</span>
+                <span style="color: #888; font-size: 12px; margin-left: 8px;">Score: {{ s.need_score }}</span>
+            </div>
+        </div>
+
+        <div class="student-meta">
+            <span>Risk: <strong style="color: {% if s.risk == 'Critical' %}#ff4444{% elif s.risk == 'At Risk' %}#ff8844{% else %}#888{% endif %};">{{ s.risk }}</strong></span>
+            {% if s.pt_score %}<span>PT: <strong>{{ s.pt_score }}</strong></span>{% endif %}
+            {% if s.confidence is not none %}<span>Confidence: <strong>{{ s.confidence }}%</strong></span>{% endif %}
+            <span>Sessions: <strong>{{ s.coaching_sessions }}</strong></span>
+            <span>Rec: <strong>{{ s.recommendation }}</strong></span>
+        </div>
+
+        {% if s.need_factors %}
+        <div class="factors">
+            {% for factor in s.need_factors %}
+            <span class="factor">{{ factor }}</span>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <div class="allocation">
+            <div class="allocation-header">
+                <span style="color: {% if s.assigned_coach == 'Adam' %}#4da6ff{% else %}#44dddd{% endif %}; font-weight: bold;">📅 {{ s.frequency|title }} with {{ s.assigned_coach }}</span>
+                <span style="color: #888;">{{ s.session_duration }} min/session ({{ s.weekly_minutes }} min/week)</span>
+                {% if s.upgraded %}
+                <span style="background: #1a3d1a; color: #44ff44; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px;">✨ UPGRADED</span>
+                {% endif %}
+            </div>
+            <div style="font-size: 12px; color: #888; margin-top: 5px;">
+                Focus: {{ s.coach_focus }}
+                {% if s.frq_need_score and s.content_need_score %}
+                <span style="margin-left: 15px;">FRQ Need: {{ s.frq_need_score }} | Content Need: {{ s.content_need_score }}</span>
+                {% endif %}
+                {% if s.upgrade_desc %}
+                <span style="margin-left: 15px; color: #44ff44;">{{ s.upgrade_desc }}</span>
+                {% endif %}
+            </div>
+        </div>
+
+        <details class="agenda">
+            <summary>View Session Agenda</summary>
+            <div style="margin-top: 10px;">
+                {% for section in s.agenda.sections %}
+                <div class="agenda-section">
+                    <div class="agenda-title">{{ section.title }} ({{ section.duration }} min)</div>
+                    {% for item in section.content %}
+                    <div class="agenda-item">• {{ item }}</div>
+                    {% endfor %}
+                </div>
+                {% endfor %}
+            </div>
+        </details>
+    </div>
+    {% endfor %}
+
+    <script>
+    let currentPriorityFilter = 'all';
+    let currentCoachFilter = 'all';
+
+    function applyFilters() {
+        const cards = document.querySelectorAll('.student-card');
+        cards.forEach(card => {
+            const matchesPriority = currentPriorityFilter === 'all' || card.dataset.priority === currentPriorityFilter;
+            const matchesCoach = currentCoachFilter === 'all' || card.dataset.coach === currentCoachFilter;
+            card.style.display = (matchesPriority && matchesCoach) ? 'block' : 'none';
+        });
+    }
+
+    function filterPriority(priority) {
+        currentPriorityFilter = priority;
+        const buttons = document.querySelectorAll('.priority-filter button');
+        buttons.forEach(b => b.classList.remove('active'));
+        event.target.classList.add('active');
+        applyFilters();
+    }
+
+    function filterCoach(coach) {
+        currentCoachFilter = coach;
+        const buttons = document.querySelectorAll('.coach-filter button');
+        buttons.forEach(b => {
+            b.classList.remove('active', 'active-adam', 'active-external');
+        });
+        if (coach === 'Adam') {
+            event.target.classList.add('active', 'active-adam');
+        } else if (coach === 'External') {
+            event.target.classList.add('active', 'active-external');
+        } else {
+            event.target.classList.add('active');
+        }
+        applyFilters();
+    }
+    </script>
 </body>
 </html>
 '''
@@ -2957,6 +5100,7 @@ COACHING_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/settings">Settings</a>
@@ -3006,13 +5150,58 @@ def student_detail(student_name, course):
 
     # Get time series
     timeseries = get_student_timeseries(data, student_name, course)
+    today = datetime.now().strftime('%Y-%m-%d')
 
-    return render_template_string(STUDENT_HTML, student=student, timeseries=timeseries)
+    return render_template_string(STUDENT_HTML, student=student, timeseries=timeseries, today=today)
 
 
 @app.route('/coaching')
 def coaching():
     return render_template_string(COACHING_HTML)
+
+
+@app.route('/planner')
+def coaching_planner():
+    """Coaching planner - prioritize students and allocate time."""
+    data = load_all_data()
+    students = build_unified_table(data)
+
+    # Get available hours from config or default
+    config = load_config()
+    adam_hours = config.get('adam_hours_per_week', 3)
+    external_hours = config.get('external_hours_per_week', 2)
+
+    # Generate the coaching plan
+    plan = calculate_coaching_plan(students, adam_hours=adam_hours, external_hours=external_hours)
+
+    return render_template_string(PLANNER_HTML, plan=plan, adam_hours=adam_hours, external_hours=external_hours)
+
+
+@app.route('/planner/settings', methods=['POST'])
+def update_planner_settings():
+    """Update coaching planner settings."""
+    config = load_config()
+    adam_hours = request.form.get('adam_hours', 3)
+    external_hours = request.form.get('external_hours', 2)
+    try:
+        config['adam_hours_per_week'] = float(adam_hours)
+        config['external_hours_per_week'] = float(external_hours)
+        save_config(config)
+    except ValueError:
+        pass
+    return redirect('/planner')
+
+
+@app.route('/api/coaching-plan')
+def api_coaching_plan():
+    """API endpoint for coaching plan data."""
+    data = load_all_data()
+    students = build_unified_table(data)
+    config = load_config()
+    adam_hours = config.get('adam_hours_per_week', 3)
+    external_hours = config.get('external_hours_per_week', 2)
+    plan = calculate_coaching_plan(students, adam_hours=adam_hours, external_hours=external_hours)
+    return jsonify(plan)
 
 
 @app.route('/api/students')
@@ -3054,6 +5243,60 @@ def api_unlock():
     """Unlock recommendations (delete lock file)."""
     delete_recommendation_lock()
     return jsonify({'success': True})
+
+
+@app.route('/api/coaching-notes/<student_name>/<course>', methods=['GET'])
+def api_get_coaching_notes(student_name, course):
+    """Get coaching notes for a student."""
+    notes = get_student_notes(student_name, course, limit=10)
+    patterns = get_coaching_patterns(student_name, course)
+    return jsonify({
+        'notes': notes,
+        'patterns': patterns
+    })
+
+
+@app.route('/api/coaching-notes/<student_name>/<course>', methods=['POST'])
+def api_add_coaching_note(student_name, course):
+    """Add a coaching note for a student."""
+    data = request.get_json() or {}
+    raw_notes = data.get('notes', '').strip()
+    call_date = data.get('date')
+
+    if not raw_notes:
+        return jsonify({'success': False, 'error': 'Notes cannot be empty'}), 400
+
+    note_entry = add_coaching_note(student_name, course, raw_notes, call_date)
+
+    return jsonify({
+        'success': True,
+        'note': note_entry
+    })
+
+
+@app.route('/api/coaching-notes/<student_name>/<course>/reprocess', methods=['POST'])
+def api_reprocess_notes(student_name, course):
+    """Reprocess all notes for a student to extract insights (if NLP failed before)."""
+    notes = load_coaching_notes()
+    key = f"{student_name}|{course}"
+
+    if key not in notes:
+        return jsonify({'success': False, 'error': 'No notes found'}), 404
+
+    reprocessed = 0
+    for note in notes[key]:
+        if not note.get('extracted', {}).get('processed', False):
+            note['extracted'] = extract_insights_from_notes(
+                note['raw_notes'], student_name, course
+            )
+            reprocessed += 1
+
+    save_coaching_notes(notes)
+
+    return jsonify({
+        'success': True,
+        'reprocessed': reprocessed
+    })
 
 
 REFRESH_HTML = '''
@@ -3107,6 +5350,7 @@ REFRESH_HTML = '''
 <body>
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/settings">Settings</a>
@@ -3603,6 +5847,7 @@ COMMS_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
@@ -3614,6 +5859,183 @@ COMMS_HTML = '''
         <strong>OpenAI not configured.</strong> Add your API key in <a href="/settings">Settings</a> to enable AI-generated messages.
     </div>
     {% endif %}
+
+    <!-- Survey Blast Section -->
+    <div class="rec-section" style="margin-bottom: 30px;">
+        <div class="rec-header" onclick="toggleSection(this)">
+            <div>
+                <span class="rec-title">Survey Blast</span>
+                <span class="rec-count">{{ survey_links|length }} configured</span>
+            </div>
+        </div>
+        <div class="rec-body open">
+            <p style="color: #aaa; margin-bottom: 15px;">Send comfort level surveys to students by course. Configure your Google Form links below.</p>
+
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                {% for course_id, course_name in [('aphg', 'APHG'), ('apgov', 'AP Gov'), ('apush', 'APUSH'), ('apworld', 'AP World')] %}
+                <div style="background: #1a1a2e; padding: 15px; border-radius: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <strong style="color: #fff;">{{ course_name }}</strong>
+                        <span style="color: #666; font-size: 12px;">{{ student_counts.get(course_id, 0) }} students</span>
+                    </div>
+                    <input type="text"
+                           id="survey-link-{{ course_id }}"
+                           placeholder="Paste Google Form URL here..."
+                           value="{{ survey_links.get(course_id, '') }}"
+                           style="width: 100%; padding: 8px; border: 1px solid #444; border-radius: 4px; background: #252540; color: #fff; font-size: 12px; margin-bottom: 10px;">
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-secondary btn-sm" onclick="saveSurveyLink('{{ course_id }}')">Save Link</button>
+                        <button class="btn btn-primary btn-sm" onclick="blastSurvey('{{ course_id }}', '{{ course_name }}')" id="blast-btn-{{ course_id }}">
+                            Send to {{ student_counts.get(course_id, 0) }} Students
+                        </button>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div style="background: #1a1a2e; padding: 15px; border-radius: 8px;">
+                <strong style="color: #fff;">Custom Message (optional)</strong>
+                <p style="color: #666; font-size: 12px; margin: 5px 0 10px;">This message will be sent along with the survey link.</p>
+                <textarea id="survey-custom-message" style="min-height: 80px;" placeholder="Hi! Please take 5 minutes to complete this quick survey about how you're feeling about the upcoming AP exam. Your honest answers help us focus our prep sessions on what you need most.">{{ survey_message }}</textarea>
+                <button class="btn btn-secondary btn-sm" onclick="saveSurveyMessage()" style="margin-top: 10px;">Save Message</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Survey Blast Modal -->
+    <div class="modal" id="survey-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="survey-modal-title">Send Survey</span>
+                <button class="close-btn" onclick="closeSurveyModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="survey-confirm-section">
+                    <p style="margin-bottom: 15px; color: #ccc;">
+                        You're about to send the comfort survey to <strong id="survey-student-count"></strong> <strong id="survey-course-name"></strong> students.
+                    </p>
+                    <div id="survey-student-list" style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 15px; max-height: 150px; overflow-y: auto; font-size: 12px; color: #888;"></div>
+
+                    <!-- Channel Selection -->
+                    <div style="background: #1a1a2e; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
+                        <strong style="color: #888; display: block; margin-bottom: 10px;">Send via:</strong>
+                        <label style="display: inline-flex; align-items: center; margin-right: 20px; cursor: pointer; color: #ccc;">
+                            <input type="checkbox" id="survey-channel-slack" checked style="margin-right: 8px; width: 18px; height: 18px;">
+                            Slack
+                        </label>
+                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #ccc;">
+                            <input type="checkbox" id="survey-channel-email" checked style="margin-right: 8px; width: 18px; height: 18px;">
+                            Email
+                        </label>
+                    </div>
+
+                    <div style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
+                        <strong style="color: #888;">Message preview:</strong>
+                        <div id="survey-message-preview" style="color: #ccc; margin-top: 8px; white-space: pre-wrap; font-size: 13px;"></div>
+                    </div>
+                </div>
+                <div id="survey-progress-section" style="display: none;">
+                    <p style="margin-bottom: 10px; color: #ccc;">Sending surveys...</p>
+                    <div style="background: #333; border-radius: 4px; height: 20px; overflow: hidden; margin-bottom: 15px;">
+                        <div id="survey-progress-fill" style="background: #4da6ff; height: 100%; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="survey-progress-text" style="color: #888; font-size: 12px;">0 / 0</div>
+                    <div id="survey-results" style="margin-top: 15px; max-height: 200px; overflow-y: auto; font-size: 12px;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeSurveyModal()">Cancel</button>
+                <button class="btn btn-primary" id="survey-send-btn" onclick="executeSurveyBlast()">Send Survey to All</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Survey Follow-up Section -->
+    <div class="rec-section" style="margin-bottom: 30px; border-left: 4px solid {% if survey_missing_total > 0 %}#ff8844{% else %}#44ff44{% endif %};">
+        <div class="rec-header" onclick="toggleSection(this)">
+            <div>
+                <span class="rec-title">📋 Survey Follow-up</span>
+                <span class="rec-count" style="background: {% if survey_missing_total > 0 %}#ff8844{% else %}#44ff44{% endif %};">{{ survey_missing_total }} missing</span>
+                <span style="color: #888; font-size: 12px; margin-left: 10px;">{{ survey_completed_total }} completed</span>
+            </div>
+            <div class="rec-actions">
+                {% if survey_missing_total > 0 %}
+                <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); sendFollowupAll()">Send Follow-up to All Missing</button>
+                {% endif %}
+            </div>
+        </div>
+        <div class="rec-body{% if survey_missing_total > 0 %} open{% endif %}">
+            {% if survey_missing_total == 0 %}
+            <div style="padding: 20px; text-align: center; color: #44ff44;">
+                <span style="font-size: 24px;">✓</span><br>
+                All students have completed the survey!
+            </div>
+            {% else %}
+            <p style="padding: 15px 20px 0; color: #aaa;">Students who haven't completed the comfort survey yet:</p>
+
+            {% for course, missing_students in survey_missing.items() %}
+            <div style="padding: 10px 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <strong style="color: #fff;">{{ course }}</strong>
+                    <button class="btn btn-secondary btn-sm" onclick="sendFollowupCourse('{{ course }}')">Send to {{ missing_students|length }} Students</button>
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                    {% for s in missing_students %}
+                    <span style="background: #1a1a2e; padding: 4px 10px; border-radius: 4px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px;"
+                          data-followup-student="{{ s.student }}" data-followup-course="{{ s.course }}">
+                        {{ s.student }}
+                        {% if s.risk == 'Critical' %}<span style="color: #ff4444;">●</span>
+                        {% elif s.risk == 'At Risk' %}<span style="color: #ff8844;">●</span>
+                        {% endif %}
+                    </span>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+
+            <div style="padding: 15px 20px; background: #1a1a2e; margin-top: 10px;">
+                <strong style="color: #888;">Follow-up Message:</strong>
+                <textarea id="followup-message" style="min-height: 80px; margin-top: 10px;">{{ survey_followup_message }}</textarea>
+                <button class="btn btn-secondary btn-sm" onclick="saveFollowupMessage()" style="margin-top: 10px;">Save Message</button>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Follow-up Modal -->
+    <div class="modal" id="followup-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="followup-modal-title">Send Survey Follow-up</span>
+                <button class="close-btn" onclick="closeFollowupModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="followup-confirm-section">
+                    <p style="margin-bottom: 15px; color: #ccc;">
+                        Send follow-up reminder to <strong id="followup-count"></strong> student(s) who haven't completed the survey:
+                    </p>
+                    <div id="followup-student-list" style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 15px; max-height: 150px; overflow-y: auto; font-size: 12px; color: #888;"></div>
+
+                    <div style="background: #1a1a2e; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
+                        <strong style="color: #888;">Message:</strong>
+                        <div id="followup-message-preview" style="color: #ccc; margin-top: 8px; white-space: pre-wrap; font-size: 13px;"></div>
+                    </div>
+                </div>
+                <div id="followup-progress-section" style="display: none;">
+                    <p style="margin-bottom: 10px; color: #ccc;">Sending follow-ups...</p>
+                    <div style="background: #333; border-radius: 4px; height: 20px; overflow: hidden; margin-bottom: 15px;">
+                        <div id="followup-progress-fill" style="background: #ff8844; height: 100%; width: 0%; transition: width 0.3s;"></div>
+                    </div>
+                    <div id="followup-progress-text" style="color: #888; font-size: 12px;">0 / 0</div>
+                    <div id="followup-results" style="margin-top: 15px; max-height: 200px; overflow-y: auto; font-size: 12px;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeFollowupModal()">Cancel</button>
+                <button class="btn btn-primary" id="followup-send-btn" onclick="executeFollowupSend()" style="background: #ff8844;">Send Follow-up</button>
+            </div>
+        </div>
+    </div>
 
     {% for rec_type, students in by_recommendation.items() %}
     <div class="rec-section">
@@ -3707,6 +6129,7 @@ COMMS_HTML = '''
     </div>
 
     <!-- Preview Modal -->
+    <div class="modal" id="preview-modal">
         <div class="modal-content">
             <div class="modal-header">
                 <span id="modal-title">Message Preview</span>
@@ -4108,6 +6531,300 @@ COMMS_HTML = '''
                 document.getElementById('bulk-retry-btn').textContent = `Retry ${failedStudents.length} Failed`;
             }
         }
+
+        // ============================================================
+        // SURVEY BLAST FUNCTIONS
+        // ============================================================
+
+        let surveyStudents = [];
+        let surveyCourse = '';
+        let surveyCourseName = '';
+
+        async function saveSurveyLink(courseId) {
+            const link = document.getElementById(`survey-link-${courseId}`).value.trim();
+            try {
+                const resp = await fetch('/api/survey/save-link', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({course: courseId, link: link})
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    // Enable/disable the blast button based on whether link exists
+                    const blastBtn = document.getElementById(`blast-btn-${courseId}`);
+                    blastBtn.disabled = !link;
+                    alert('Survey link saved!');
+                } else {
+                    alert('Failed to save: ' + data.error);
+                }
+            } catch (e) {
+                alert('Error saving link: ' + e.message);
+            }
+        }
+
+        async function saveSurveyMessage() {
+            const message = document.getElementById('survey-custom-message').value.trim();
+            try {
+                const resp = await fetch('/api/survey/save-message', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message: message})
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    alert('Survey message saved!');
+                } else {
+                    alert('Failed to save: ' + data.error);
+                }
+            } catch (e) {
+                alert('Error saving message: ' + e.message);
+            }
+        }
+
+        async function blastSurvey(courseId, courseName) {
+            surveyCourse = courseId;
+            surveyCourseName = courseName;
+
+            // Get students for this course
+            try {
+                const resp = await fetch(`/api/survey/students/${courseId}`);
+                const data = await resp.json();
+                surveyStudents = data.students || [];
+
+                if (surveyStudents.length === 0) {
+                    alert('No students found for ' + courseName);
+                    return;
+                }
+
+                // Populate modal
+                document.getElementById('survey-modal-title').textContent = `Send ${courseName} Comfort Survey`;
+                document.getElementById('survey-student-count').textContent = surveyStudents.length;
+                document.getElementById('survey-course-name').textContent = courseName;
+                document.getElementById('survey-student-list').innerHTML = surveyStudents.map(s => s.name).join(', ');
+
+                // Build message preview
+                const customMsg = document.getElementById('survey-custom-message').value.trim();
+                const surveyLink = document.getElementById(`survey-link-${courseId}`).value.trim();
+                const fullMessage = customMsg + '\\n\\n' + surveyLink;
+                document.getElementById('survey-message-preview').textContent = fullMessage;
+
+                // Reset modal state
+                document.getElementById('survey-confirm-section').style.display = 'block';
+                document.getElementById('survey-progress-section').style.display = 'none';
+                document.getElementById('survey-send-btn').style.display = 'inline-block';
+                document.getElementById('survey-send-btn').disabled = false;
+                document.getElementById('survey-send-btn').textContent = 'Send Survey to All';
+
+                document.getElementById('survey-modal').classList.add('open');
+            } catch (e) {
+                alert('Error loading students: ' + e.message);
+            }
+        }
+
+        function closeSurveyModal() {
+            document.getElementById('survey-modal').classList.remove('open');
+            surveyStudents = [];
+        }
+
+        async function executeSurveyBlast() {
+            // Get selected channels
+            const useSlack = document.getElementById('survey-channel-slack').checked;
+            const useEmail = document.getElementById('survey-channel-email').checked;
+
+            if (!useSlack && !useEmail) {
+                alert('Please select at least one channel (Slack or Email)');
+                return;
+            }
+
+            document.getElementById('survey-confirm-section').style.display = 'none';
+            document.getElementById('survey-progress-section').style.display = 'block';
+            document.getElementById('survey-send-btn').disabled = true;
+            document.getElementById('survey-send-btn').textContent = 'Sending...';
+
+            const customMsg = document.getElementById('survey-custom-message').value.trim();
+            const surveyLink = document.getElementById(`survey-link-${surveyCourse}`).value.trim();
+            const fullMessage = customMsg + '\\n\\n' + surveyLink;
+
+            const total = surveyStudents.length;
+            let completed = 0;
+            let successCount = 0;
+            let resultsHtml = '';
+
+            for (const student of surveyStudents) {
+                try {
+                    const resp = await fetch('/api/survey/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            student_name: student.name,
+                            course: surveyCourse,
+                            message: fullMessage,
+                            channels: {slack: useSlack, email: useEmail}
+                        })
+                    });
+                    const data = await resp.json();
+
+                    const slackOk = !useSlack || data.slack_student?.success;
+                    const emailOk = !useEmail || data.email_student?.success;
+                    const anyOk = (useSlack && data.slack_student?.success) || (useEmail && data.email_student?.success);
+
+                    let statusParts = [];
+                    if (useSlack) statusParts.push(data.slack_student?.success ? 'Slack OK' : 'Slack fail');
+                    if (useEmail) statusParts.push(data.email_student?.success ? 'Email OK' : 'Email fail');
+
+                    const icon = anyOk ? '&#10004;' : '&#10008;';
+                    const color = anyOk ? '#44ff44' : '#ff4444';
+                    resultsHtml += `<div style="color: ${color};">${icon} ${student.name}: ${statusParts.join(', ')}</div>`;
+
+                    if (anyOk) successCount++;
+                } catch (e) {
+                    resultsHtml += `<div style="color: #ff4444;">&#10008; ${student.name}: ${e.message}</div>`;
+                }
+
+                completed++;
+                const pct = (completed / total) * 100;
+                document.getElementById('survey-progress-fill').style.width = pct + '%';
+                document.getElementById('survey-progress-text').textContent = `${completed} / ${total}`;
+                document.getElementById('survey-results').innerHTML = resultsHtml;
+
+                // Small delay between sends
+                await new Promise(r => setTimeout(r, 300));
+            }
+
+            document.getElementById('survey-progress-text').textContent = `Done! ${successCount} succeeded, ${total - successCount} failed`;
+            document.getElementById('survey-send-btn').textContent = 'Complete';
+        }
+
+        // ============================================================
+        // SURVEY FOLLOW-UP FUNCTIONS
+        // ============================================================
+
+        let followupStudents = [];
+
+        function sendFollowupAll() {
+            // Get all students missing survey
+            followupStudents = [];
+            document.querySelectorAll('[data-followup-student]').forEach(el => {
+                followupStudents.push({
+                    name: el.dataset.followupStudent,
+                    course: el.dataset.followupCourse
+                });
+            });
+            openFollowupModal();
+        }
+
+        function sendFollowupCourse(course) {
+            // Get students missing survey for specific course
+            followupStudents = [];
+            document.querySelectorAll(`[data-followup-course="${course}"]`).forEach(el => {
+                followupStudents.push({
+                    name: el.dataset.followupStudent,
+                    course: el.dataset.followupCourse
+                });
+            });
+            openFollowupModal();
+        }
+
+        function openFollowupModal() {
+            if (followupStudents.length === 0) {
+                alert('No students to send follow-up to');
+                return;
+            }
+
+            const message = document.getElementById('followup-message').value.trim();
+
+            document.getElementById('followup-count').textContent = followupStudents.length;
+            document.getElementById('followup-student-list').innerHTML = followupStudents.map(s => `${s.name} (${s.course})`).join(', ');
+            document.getElementById('followup-message-preview').textContent = message;
+
+            // Reset to confirm section
+            document.getElementById('followup-confirm-section').style.display = 'block';
+            document.getElementById('followup-progress-section').style.display = 'none';
+            document.getElementById('followup-send-btn').style.display = 'inline-block';
+            document.getElementById('followup-send-btn').disabled = false;
+            document.getElementById('followup-send-btn').textContent = 'Send Follow-up';
+
+            document.getElementById('followup-modal').classList.add('open');
+        }
+
+        function closeFollowupModal() {
+            document.getElementById('followup-modal').classList.remove('open');
+            followupStudents = [];
+        }
+
+        async function saveFollowupMessage() {
+            const message = document.getElementById('followup-message').value.trim();
+            try {
+                const resp = await fetch('/api/survey/save-followup-message', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message: message})
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    alert('Follow-up message saved!');
+                } else {
+                    alert('Failed to save: ' + data.error);
+                }
+            } catch (e) {
+                alert('Error saving message: ' + e.message);
+            }
+        }
+
+        async function executeFollowupSend() {
+            const message = document.getElementById('followup-message').value.trim();
+            if (!message) {
+                alert('Please enter a follow-up message');
+                return;
+            }
+
+            document.getElementById('followup-confirm-section').style.display = 'none';
+            document.getElementById('followup-progress-section').style.display = 'block';
+            document.getElementById('followup-send-btn').disabled = true;
+
+            const total = followupStudents.length;
+            let completed = 0;
+            let successCount = 0;
+            let resultsHtml = '';
+
+            for (const student of followupStudents) {
+                try {
+                    const resp = await fetch('/api/comms/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            student_name: student.name,
+                            course: student.course,
+                            message: message
+                        })
+                    });
+                    const data = await resp.json();
+
+                    const slackOk = data.slack_student?.success;
+                    const emailOk = data.email_student?.success;
+                    const anyOk = slackOk || emailOk;
+                    const icon = anyOk ? '&#10004;' : '&#10008;';
+                    const color = anyOk ? '#44ff44' : '#ff4444';
+                    resultsHtml += `<div style="color: ${color};">${icon} ${student.name}: Slack ${slackOk ? 'OK' : 'fail'}, Email ${emailOk ? 'OK' : 'fail'}</div>`;
+
+                    if (anyOk) successCount++;
+                } catch (e) {
+                    resultsHtml += `<div style="color: #ff4444;">&#10008; ${student.name}: ${e.message}</div>`;
+                }
+
+                completed++;
+                const pct = (completed / total) * 100;
+                document.getElementById('followup-progress-fill').style.width = pct + '%';
+                document.getElementById('followup-progress-text').textContent = `${completed} / ${total}`;
+                document.getElementById('followup-results').innerHTML = resultsHtml;
+
+                // Small delay between sends
+                await new Promise(r => setTimeout(r, 300));
+            }
+
+            document.getElementById('followup-progress-text').textContent = `Done! ${successCount} succeeded, ${total - successCount} failed`;
+            document.getElementById('followup-send-btn').textContent = 'Complete';
+        }
     </script>
 </body>
 </html>
@@ -4124,7 +6841,42 @@ def comms_page():
     config = load_config()
     openai_configured = bool(config.get('openai_api_key') or os.environ.get('OPENAI_API_KEY'))
 
-    return render_template_string(COMMS_HTML, by_recommendation=by_rec, openai_configured=openai_configured)
+    # Survey blast data
+    survey_links = config.get('survey_links', {})
+    survey_message = config.get('survey_message', 'Hi! Please take 5 minutes to complete this quick survey about how you\'re feeling about the upcoming AP exam. Your honest answers help us focus our prep sessions on what you need most.')
+
+    # Count students per course
+    student_counts = {}
+    for s in students:
+        course = s.get('course', '').lower()
+        # Normalize course names
+        if course in ['aphg', 'ap human geography']:
+            course = 'aphg'
+        elif course in ['apgov', 'ap gov', 'ap government']:
+            course = 'apgov'
+        elif course in ['apush', 'ap us history']:
+            course = 'apush'
+        elif course in ['apworld', 'ap world', 'apwh', 'ap world history']:
+            course = 'apworld'
+        student_counts[course] = student_counts.get(course, 0) + 1
+
+    # Survey follow-up: students who haven't completed the survey
+    surveys = load_self_assessment_data()
+    survey_missing = get_students_without_survey(students, surveys)
+    survey_missing_total = sum(len(v) for v in survey_missing.values())
+    survey_completed_total = len(surveys)
+    survey_followup_message = config.get('survey_followup_message', "Hey! Just a quick reminder - we haven't received your AP exam comfort survey yet. It only takes 5 minutes and helps us customize your prep sessions.\n\nPlease complete it when you get a chance - your input really helps!")
+
+    return render_template_string(COMMS_HTML,
+                                  by_recommendation=by_rec,
+                                  openai_configured=openai_configured,
+                                  survey_links=survey_links,
+                                  survey_message=survey_message,
+                                  student_counts=student_counts,
+                                  survey_missing=survey_missing,
+                                  survey_missing_total=survey_missing_total,
+                                  survey_completed_total=survey_completed_total,
+                                  survey_followup_message=survey_followup_message)
 
 
 @app.route('/api/comms/preview', methods=['POST'])
@@ -4179,6 +6931,153 @@ def api_comms_send():
 
     # Record in history
     record_comms_send(student_name, student.get('recommendation', 'Unknown'))
+
+    return jsonify(results)
+
+
+# =============================================================================
+# SURVEY BLAST API
+# =============================================================================
+
+@app.route('/api/survey/save-link', methods=['POST'])
+def api_survey_save_link():
+    """Save a survey link for a course."""
+    req = request.json
+    course = req.get('course', '').lower()
+    link = req.get('link', '').strip()
+
+    if course not in ['aphg', 'apgov', 'apush', 'apworld']:
+        return jsonify({'success': False, 'error': 'Invalid course'}), 400
+
+    config = load_config()
+    if 'survey_links' not in config:
+        config['survey_links'] = {}
+    config['survey_links'][course] = link
+    save_config(config)
+
+    return jsonify({'success': True})
+
+
+@app.route('/api/survey/save-message', methods=['POST'])
+def api_survey_save_message():
+    """Save the custom survey message."""
+    req = request.json
+    message = req.get('message', '').strip()
+
+    config = load_config()
+    config['survey_message'] = message
+    save_config(config)
+
+    return jsonify({'success': True})
+
+
+@app.route('/api/survey/save-followup-message', methods=['POST'])
+def api_survey_save_followup_message():
+    """Save the follow-up survey reminder message."""
+    req = request.json
+    message = req.get('message', '').strip()
+
+    config = load_config()
+    config['survey_followup_message'] = message
+    save_config(config)
+
+    return jsonify({'success': True})
+
+
+@app.route('/api/survey/students/<course>')
+def api_survey_students(course):
+    """Get list of students for a course."""
+    course = course.lower()
+
+    data = load_all_data()
+    students = build_unified_table(data)
+
+    # Filter by course (normalize course names)
+    course_students = []
+    for s in students:
+        student_course = s.get('course', '').lower()
+        # Normalize
+        if student_course in ['aphg', 'ap human geography']:
+            student_course = 'aphg'
+        elif student_course in ['apgov', 'ap gov', 'ap government']:
+            student_course = 'apgov'
+        elif student_course in ['apush', 'ap us history']:
+            student_course = 'apush'
+        elif student_course in ['apworld', 'ap world', 'apwh', 'ap world history']:
+            student_course = 'apworld'
+
+        if student_course == course:
+            course_students.append({
+                'name': s.get('student', ''),
+                'email': s.get('email', ''),
+                'course': s.get('course', '')
+            })
+
+    return jsonify({'students': course_students})
+
+
+@app.route('/api/survey/send', methods=['POST'])
+def api_survey_send():
+    """Send survey message to a student via selected channels."""
+    req = request.json
+    student_name = req.get('student_name')
+    course = req.get('course')
+    message_text = req.get('message')
+    channels = req.get('channels', {'slack': True, 'email': True})
+
+    if not message_text:
+        return jsonify({'error': 'No message provided'}), 400
+
+    # Load student data
+    data = load_all_data()
+    students = build_unified_table(data)
+
+    # Find student (more flexible matching)
+    student = None
+    for s in students:
+        if s.get('student') == student_name:
+            student_course = s.get('course', '').lower()
+            # Normalize course for comparison
+            if student_course in ['aphg', 'ap human geography']:
+                student_course = 'aphg'
+            elif student_course in ['apgov', 'ap gov', 'ap government']:
+                student_course = 'apgov'
+            elif student_course in ['apush', 'ap us history']:
+                student_course = 'apush'
+            elif student_course in ['apworld', 'ap world', 'apwh', 'ap world history']:
+                student_course = 'apworld'
+
+            if student_course == course.lower():
+                student = s
+                break
+
+    if not student:
+        return jsonify({'error': 'Student not found'}), 404
+
+    # Send to selected channels only
+    results = {
+        'slack_student': {'success': False, 'message': 'Not selected'},
+        'email_student': {'success': False, 'message': 'Not selected'}
+    }
+
+    # Get student email
+    student_info = STUDENTS.get(student_name, {})
+    student_email = student_info.get('email', '')
+    if not student_email and student_name:
+        student_email = student_name.lower().replace(' ', '.') + '@alpha.school'
+
+    # Send via Slack if selected
+    if channels.get('slack') and student_email:
+        success, msg = send_slack_dm(student_email, message_text)
+        results['slack_student'] = {'success': success, 'message': msg}
+
+    # Send via Email if selected
+    if channels.get('email') and student_email:
+        course_name = student.get('course', 'AP Course')
+        subject = f"{course_name} - Comfort Survey"
+        html_body = message_text.replace('\n\n', '<br><br>').replace('\n', '<br>')
+        success, msg = send_email(student_email, subject, message_text, html_body)
+        results['email_student'] = {'success': success, 'message': msg}
 
     return jsonify(results)
 
@@ -4245,6 +7144,7 @@ SETTINGS_HTML = '''
 
     <nav class="nav">
         <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
