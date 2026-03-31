@@ -5204,6 +5204,768 @@ def api_coaching_plan():
     return jsonify(plan)
 
 
+# =============================================================================
+# EXTERNAL COACH SCHEDULER
+# =============================================================================
+
+def generate_external_schedule(start_date, num_weeks=2):
+    """
+    Generate available time slots for external coach.
+
+    Schedule:
+    - Tuesdays: 1pm - 3pm (UK time)
+    - Wednesdays: 9am - 12pm, 1pm - 2pm (lunch break 12-1)
+    - Thursdays: 1:30pm - 3pm
+    - Overflow: Mondays/Fridays as needed
+    """
+    slots = []
+    current = start_date
+
+    # Find the start of the week (Monday)
+    days_since_monday = current.weekday()
+    week_start = current - timedelta(days=days_since_monday)
+
+    for week in range(num_weeks):
+        week_base = week_start + timedelta(weeks=week)
+
+        # Monday (overflow) - 1pm - 3pm
+        monday = week_base
+        if monday >= start_date:
+            for hour in [13, 14]:
+                for minute in [0, 20, 40]:
+                    slot_time = monday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if slot_time >= start_date:
+                        slots.append({
+                            'datetime': slot_time,
+                            'day': 'Monday',
+                            'date': slot_time.strftime('%Y-%m-%d'),
+                            'time': slot_time.strftime('%H:%M'),
+                            'display': slot_time.strftime('%a %b %d %H:%M'),
+                            'overflow': True
+                        })
+
+        # Tuesday - 1pm to 3pm
+        tuesday = week_base + timedelta(days=1)
+        if tuesday >= start_date or (tuesday.date() == start_date.date() and start_date.hour < 15):
+            for hour in [13, 14]:
+                for minute in [0, 20, 40]:
+                    slot_time = tuesday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if slot_time >= start_date:
+                        slots.append({
+                            'datetime': slot_time,
+                            'day': 'Tuesday',
+                            'date': slot_time.strftime('%Y-%m-%d'),
+                            'time': slot_time.strftime('%H:%M'),
+                            'display': slot_time.strftime('%a %b %d %H:%M'),
+                            'overflow': False
+                        })
+
+        # Wednesday - 9am to 12pm, then 1pm to 2pm
+        wednesday = week_base + timedelta(days=2)
+        if wednesday.date() >= start_date.date():
+            # Morning block: 9am - 12pm
+            for hour in [9, 10, 11]:
+                for minute in [0, 20, 40]:
+                    slot_time = wednesday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    slots.append({
+                        'datetime': slot_time,
+                        'day': 'Wednesday',
+                        'date': slot_time.strftime('%Y-%m-%d'),
+                        'time': slot_time.strftime('%H:%M'),
+                        'display': slot_time.strftime('%a %b %d %H:%M'),
+                        'overflow': False
+                    })
+            # Afternoon block: 1pm - 2pm
+            for minute in [0, 20, 40]:
+                slot_time = wednesday.replace(hour=13, minute=minute, second=0, microsecond=0)
+                slots.append({
+                    'datetime': slot_time,
+                    'day': 'Wednesday',
+                    'date': slot_time.strftime('%Y-%m-%d'),
+                    'time': slot_time.strftime('%H:%M'),
+                    'display': slot_time.strftime('%a %b %d %H:%M'),
+                    'overflow': False
+                })
+
+        # Thursday - 1:30pm to 3pm
+        thursday = week_base + timedelta(days=3)
+        for hour_min in [(13, 30), (13, 50), (14, 10), (14, 30)]:
+            slot_time = thursday.replace(hour=hour_min[0], minute=hour_min[1], second=0, microsecond=0)
+            if slot_time >= start_date:
+                slots.append({
+                    'datetime': slot_time,
+                    'day': 'Thursday',
+                    'date': slot_time.strftime('%Y-%m-%d'),
+                    'time': slot_time.strftime('%H:%M'),
+                    'display': slot_time.strftime('%a %b %d %H:%M'),
+                    'overflow': False
+                })
+
+        # Friday (overflow) - 1pm - 3pm
+        friday = week_base + timedelta(days=4)
+        for hour in [13, 14]:
+            for minute in [0, 20, 40]:
+                slot_time = friday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if slot_time >= start_date:
+                    slots.append({
+                        'datetime': slot_time,
+                        'day': 'Friday',
+                        'date': slot_time.strftime('%Y-%m-%d'),
+                        'time': slot_time.strftime('%H:%M'),
+                        'display': slot_time.strftime('%a %b %d %H:%M'),
+                        'overflow': True
+                    })
+
+    # Sort by datetime and filter out overflow initially
+    slots.sort(key=lambda x: x['datetime'])
+    return slots
+
+
+def allocate_students_to_slots(students, slots):
+    """
+    Allocate students to time slots based on priority.
+    Returns list of bookings with student + slot info.
+    """
+    bookings = []
+
+    # Sort students by need/priority
+    # Critical and High priority first, then by course for batching
+    priority_order = {'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3, 'At Risk': 1, 'On Track': 2, 'Strong': 3}
+    sorted_students = sorted(students, key=lambda x: (
+        priority_order.get(x.get('risk', 'Unknown'), 5),
+        x.get('course', ''),
+        x.get('student', '')
+    ))
+
+    # Separate main slots from overflow
+    main_slots = [s for s in slots if not s['overflow']]
+    overflow_slots = [s for s in slots if s['overflow']]
+
+    slot_idx = 0
+    overflow_idx = 0
+
+    for student in sorted_students:
+        # Try main slots first
+        if slot_idx < len(main_slots):
+            slot = main_slots[slot_idx]
+            slot_idx += 1
+        elif overflow_idx < len(overflow_slots):
+            slot = overflow_slots[overflow_idx]
+            overflow_idx += 1
+        else:
+            # No more slots - mark as unscheduled
+            bookings.append({
+                'student': student,
+                'slot': None,
+                'scheduled': False
+            })
+            continue
+
+        bookings.append({
+            'student': student,
+            'slot': slot,
+            'scheduled': True
+        })
+
+    return bookings
+
+
+def generate_external_coach_plan(bookings):
+    """Generate the full external coach plan with agendas."""
+    plan = {
+        'bookings': [],
+        'by_day': {},
+        'summary': {
+            'total_students': len(bookings),
+            'scheduled': len([b for b in bookings if b['scheduled']]),
+            'unscheduled': len([b for b in bookings if not b['scheduled']]),
+            'total_hours': 0
+        }
+    }
+
+    for booking in bookings:
+        if not booking['scheduled']:
+            plan['bookings'].append(booking)
+            continue
+
+        student = booking['student']
+        slot = booking['slot']
+
+        # Generate agenda for this student
+        agenda = generate_session_agenda(student)
+
+        booking_detail = {
+            'student_name': student.get('student', 'Unknown'),
+            'course': student.get('course', 'Unknown'),
+            'email': student.get('email', ''),
+            'risk': student.get('risk', 'Unknown'),
+            'pt_mcq': student.get('pt_mcq'),
+            'pt_frq': student.get('pt_frq'),
+            'pt_score': student.get('pt_score'),
+            'recommendation': student.get('recommendation', ''),
+            'slot': slot,
+            'agenda': agenda,
+            'scheduled': True
+        }
+
+        plan['bookings'].append(booking_detail)
+
+        # Group by day
+        day_key = slot['date']
+        if day_key not in plan['by_day']:
+            plan['by_day'][day_key] = {
+                'date': day_key,
+                'day_name': slot['day'],
+                'display': slot['datetime'].strftime('%A, %B %d'),
+                'sessions': []
+            }
+        plan['by_day'][day_key]['sessions'].append(booking_detail)
+
+    # Calculate total hours (20 min per session)
+    plan['summary']['total_hours'] = round(plan['summary']['scheduled'] * 20 / 60, 1)
+
+    return plan
+
+
+EXTERNAL_SCHEDULER_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>External Coach Scheduler</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 5px; color: #fff; }
+        h2 { margin: 20px 0 10px; color: #fff; font-size: 18px; }
+        h3 { margin: 15px 0 8px; color: #44dddd; font-size: 16px; }
+        .subtitle { color: #888; margin-bottom: 20px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { color: #4da6ff; margin-right: 20px; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .summary-card {
+            background: #252540;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .summary-value { font-size: 28px; font-weight: bold; }
+        .summary-label { color: #888; font-size: 12px; margin-top: 5px; }
+
+        .actions {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn-primary { background: #4da6ff; color: #fff; }
+        .btn-primary:hover { background: #3d96ef; }
+        .btn-success { background: #44dd44; color: #1a1a2e; }
+        .btn-success:hover { background: #34cd34; }
+        .btn-warning { background: #ff8844; color: #fff; }
+        .btn-warning:hover { background: #ee7733; }
+
+        .day-section {
+            background: #252540;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        .day-header {
+            background: #353560;
+            padding: 15px 20px;
+            font-weight: bold;
+            font-size: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .day-count {
+            background: #44dddd;
+            color: #1a1a2e;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+
+        .session-card {
+            padding: 15px 20px;
+            border-top: 1px solid #333;
+        }
+        .session-card:hover { background: #2a2a4a; }
+        .session-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+        .session-time {
+            background: #44dddd;
+            color: #1a1a2e;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .session-student {
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .session-course {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        .course-APHG { background: #2d5a27; }
+        .course-APWH { background: #5a2727; }
+        .course-APUSH { background: #27415a; }
+        .course-APGOV { background: #5a4a27; }
+
+        .session-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+        }
+        .session-meta strong { color: #ccc; }
+
+        .risk-Critical { color: #ff4444; }
+        .risk-High, .risk-AtRisk { color: #ff8844; }
+        .risk-Medium, .risk-OnTrack { color: #ffaa00; }
+        .risk-Low, .risk-Strong { color: #44ff44; }
+
+        .agenda-preview {
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 12px;
+        }
+        .agenda-item {
+            padding: 4px 0;
+            color: #aaa;
+        }
+        .agenda-item strong { color: #44dddd; }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.open { display: flex; }
+        .modal-content {
+            background: #252540;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 600px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            padding: 15px 20px;
+            background: #353560;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-body { padding: 20px; }
+        .modal-footer {
+            padding: 15px 20px;
+            background: #1a1a2e;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        .close-btn {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 24px;
+            cursor: pointer;
+        }
+        .close-btn:hover { color: #fff; }
+
+        .progress-bar {
+            background: #333;
+            border-radius: 4px;
+            height: 20px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+        .progress-fill {
+            background: #44dddd;
+            height: 100%;
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        @media print {
+            body { background: #fff; color: #000; }
+            .nav, .actions, .btn { display: none; }
+            .day-section { break-inside: avoid; }
+            .session-card { border: 1px solid #ccc; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="nav">
+        <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
+        <a href="/external-scheduler" style="font-weight: bold;">External Scheduler</a>
+        <a href="/comms">Communications</a>
+    </nav>
+
+    <h1>External Coach Schedule</h1>
+    <p class="subtitle">Week of {{ start_date }} - Exam Strategy Sessions (20 min each)</p>
+
+    <div class="summary-grid">
+        <div class="summary-card">
+            <div class="summary-value">{{ plan.summary.scheduled }}</div>
+            <div class="summary-label">Sessions Scheduled</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-value">{{ plan.summary.total_hours }}h</div>
+            <div class="summary-label">Total Coach Time</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-value" style="color: {% if plan.summary.unscheduled > 0 %}#ff8844{% else %}#44ff44{% endif %};">
+                {{ plan.summary.unscheduled }}
+            </div>
+            <div class="summary-label">Unscheduled</div>
+        </div>
+    </div>
+
+    <div class="actions">
+        <a href="/external-scheduler/pdf" class="btn btn-primary" target="_blank">
+            Download PDF
+        </a>
+        <button class="btn btn-success" onclick="openBlastModal()">
+            Send All Bookings
+        </button>
+        <button class="btn btn-warning" onclick="window.print()">
+            Print Schedule
+        </button>
+    </div>
+
+    {% for date, day in plan.by_day.items() | sort %}
+    <div class="day-section">
+        <div class="day-header">
+            <span>{{ day.display }}</span>
+            <span class="day-count">{{ day.sessions | length }} sessions</span>
+        </div>
+
+        {% for session in day.sessions %}
+        <div class="session-card">
+            <div class="session-header">
+                <div>
+                    <span class="session-student">{{ session.student_name }}</span>
+                    <span class="session-course course-{{ session.course }}">{{ session.course }}</span>
+                </div>
+                <span class="session-time">{{ session.slot.time }}</span>
+            </div>
+
+            <div class="session-meta">
+                <span>Risk: <strong class="risk-{{ session.risk | replace(' ', '') }}">{{ session.risk }}</strong></span>
+                {% if session.pt_score %}<span>PT Score: <strong>{{ session.pt_score }}</strong></span>{% endif %}
+                {% if session.pt_mcq and session.pt_frq %}<span>MCQ: {{ session.pt_mcq }}% / FRQ: {{ session.pt_frq }}%</span>{% endif %}
+                <span>Rec: <strong>{{ session.recommendation }}</strong></span>
+            </div>
+
+            <div class="agenda-preview">
+                {% for section in session.agenda.sections[:3] %}
+                <div class="agenda-item"><strong>{{ section.title }}:</strong> {{ section.content[0] if section.content else '' }}</div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+
+    {% if plan.summary.unscheduled > 0 %}
+    <div class="day-section" style="border-left: 4px solid #ff8844;">
+        <div class="day-header" style="background: #5a3a1a;">
+            <span>Unscheduled Students</span>
+            <span class="day-count" style="background: #ff8844;">{{ plan.summary.unscheduled }}</span>
+        </div>
+        {% for booking in plan.bookings if not booking.scheduled %}
+        <div class="session-card">
+            <span class="session-student">{{ booking.student.student }}</span>
+            <span class="session-course course-{{ booking.student.course }}">{{ booking.student.course }}</span>
+            <span style="color: #888; margin-left: 15px;">Needs overflow slot</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Blast Modal -->
+    <div class="modal" id="blast-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span>Send Booking Notifications</span>
+                <button class="close-btn" onclick="closeBlastModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="blast-confirm">
+                    <p style="margin-bottom: 15px;">Send booking confirmations to <strong>{{ plan.summary.scheduled }}</strong> students?</p>
+                    <p style="color: #888; font-size: 13px;">Each student will receive their scheduled time and session agenda via Slack and email.</p>
+                </div>
+                <div id="blast-progress" style="display: none;">
+                    <p>Sending notifications...</p>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <p id="progress-text" style="color: #888; font-size: 12px;">0 / {{ plan.summary.scheduled }}</p>
+                    <div id="blast-results" style="margin-top: 15px; max-height: 200px; overflow-y: auto; font-size: 12px;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" style="background: #666;" onclick="closeBlastModal()">Cancel</button>
+                <button class="btn btn-success" id="blast-send-btn" onclick="executeBlast()">Send All</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const bookings = {{ bookings_json | safe }};
+
+    function openBlastModal() {
+        document.getElementById('blast-confirm').style.display = 'block';
+        document.getElementById('blast-progress').style.display = 'none';
+        document.getElementById('blast-send-btn').style.display = 'inline-block';
+        document.getElementById('blast-modal').classList.add('open');
+    }
+
+    function closeBlastModal() {
+        document.getElementById('blast-modal').classList.remove('open');
+    }
+
+    async function executeBlast() {
+        document.getElementById('blast-confirm').style.display = 'none';
+        document.getElementById('blast-progress').style.display = 'block';
+        document.getElementById('blast-send-btn').style.display = 'none';
+
+        const scheduled = bookings.filter(b => b.scheduled);
+        const total = scheduled.length;
+        let completed = 0;
+        let successCount = 0;
+        let resultsHtml = '';
+
+        for (const booking of scheduled) {
+            try {
+                const message = `Hi ${booking.student_name}!
+
+Your AP Exam Strategy session has been scheduled:
+
+Date: ${booking.slot.display}
+Time: ${booking.slot.time} (UK time)
+Duration: 20 minutes
+
+Session Focus:
+${booking.agenda.sections.map(s => '- ' + s.title).join('\\n')}
+
+Please be ready a few minutes early. Looking forward to helping you prepare!`;
+
+                const resp = await fetch('/api/comms/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        student_name: booking.student_name,
+                        course: booking.course,
+                        message: message
+                    })
+                });
+                const data = await resp.json();
+
+                const anyOk = data.slack_student?.success || data.email_student?.success;
+                const icon = anyOk ? '✓' : '✗';
+                const color = anyOk ? '#44ff44' : '#ff4444';
+                resultsHtml += `<div style="color: ${color};">${icon} ${booking.student_name}</div>`;
+                if (anyOk) successCount++;
+            } catch (e) {
+                resultsHtml += `<div style="color: #ff4444;">✗ ${booking.student_name}: ${e.message}</div>`;
+            }
+
+            completed++;
+            const pct = (completed / total) * 100;
+            document.getElementById('progress-fill').style.width = pct + '%';
+            document.getElementById('progress-text').textContent = `${completed} / ${total}`;
+            document.getElementById('blast-results').innerHTML = resultsHtml;
+
+            await new Promise(r => setTimeout(r, 300));
+        }
+
+        document.getElementById('progress-text').textContent = `Done! ${successCount} succeeded, ${total - successCount} failed`;
+    }
+    </script>
+</body>
+</html>
+'''
+
+
+@app.route('/external-scheduler')
+def external_scheduler():
+    """External coach scheduling page."""
+    data = load_all_data()
+    students = build_unified_table(data)
+
+    # Start from today at 1pm UK time
+    start_date = datetime.now().replace(hour=13, minute=0, second=0, microsecond=0)
+
+    # Generate slots for 2 weeks
+    slots = generate_external_schedule(start_date, num_weeks=2)
+
+    # Allocate students to slots
+    bookings = allocate_students_to_slots(students, slots)
+
+    # Generate full plan
+    plan = generate_external_coach_plan(bookings)
+
+    # Prepare JSON for JavaScript
+    bookings_for_js = []
+    for b in plan['bookings']:
+        if b.get('scheduled'):
+            bookings_for_js.append({
+                'student_name': b['student_name'],
+                'course': b['course'],
+                'slot': b['slot'],
+                'agenda': b['agenda'],
+                'scheduled': True
+            })
+
+    return render_template_string(
+        EXTERNAL_SCHEDULER_HTML,
+        plan=plan,
+        start_date=start_date.strftime('%B %d, %Y'),
+        bookings_json=json.dumps(bookings_for_js, default=str)
+    )
+
+
+@app.route('/external-scheduler/pdf')
+def external_scheduler_pdf():
+    """Generate PDF of external coach schedule."""
+    data = load_all_data()
+    students = build_unified_table(data)
+
+    start_date = datetime.now().replace(hour=13, minute=0, second=0, microsecond=0)
+    slots = generate_external_schedule(start_date, num_weeks=2)
+    bookings = allocate_students_to_slots(students, slots)
+    plan = generate_external_coach_plan(bookings)
+
+    # Generate HTML for PDF
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>External Coach Schedule</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; padding: 20px; color: #333; }}
+        h1 {{ color: #2c5282; border-bottom: 2px solid #2c5282; padding-bottom: 10px; }}
+        h2 {{ color: #2d3748; margin-top: 30px; background: #e2e8f0; padding: 10px; }}
+        .summary {{ display: flex; gap: 30px; margin-bottom: 30px; }}
+        .summary-item {{ text-align: center; }}
+        .summary-value {{ font-size: 32px; font-weight: bold; color: #2c5282; }}
+        .summary-label {{ color: #718096; font-size: 12px; }}
+        .session {{ border: 1px solid #e2e8f0; padding: 15px; margin-bottom: 15px; page-break-inside: avoid; }}
+        .session-header {{ display: flex; justify-content: space-between; margin-bottom: 10px; }}
+        .student-name {{ font-size: 18px; font-weight: bold; }}
+        .time {{ background: #2c5282; color: white; padding: 5px 15px; border-radius: 4px; }}
+        .meta {{ color: #718096; font-size: 12px; margin-bottom: 10px; }}
+        .agenda {{ background: #f7fafc; padding: 10px; border-radius: 4px; }}
+        .agenda-item {{ margin: 5px 0; font-size: 13px; }}
+        .course {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; color: white; }}
+        .APHG {{ background: #48bb78; }}
+        .APWH {{ background: #f56565; }}
+        .APUSH {{ background: #4299e1; }}
+        .APGOV {{ background: #ed8936; }}
+        @page {{ margin: 1cm; }}
+    </style>
+</head>
+<body>
+    <h1>External Coach Schedule</h1>
+    <p>Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}</p>
+
+    <div class="summary">
+        <div class="summary-item">
+            <div class="summary-value">{plan['summary']['scheduled']}</div>
+            <div class="summary-label">Sessions</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-value">{plan['summary']['total_hours']}h</div>
+            <div class="summary-label">Total Time</div>
+        </div>
+    </div>
+'''
+
+    for date in sorted(plan['by_day'].keys()):
+        day = plan['by_day'][date]
+        html += f'<h2>{day["display"]} ({len(day["sessions"])} sessions)</h2>'
+
+        for session in day['sessions']:
+            agenda_items = ''.join([
+                f'<div class="agenda-item"><strong>{s["title"]}:</strong> {s["content"][0] if s["content"] else ""}</div>'
+                for s in session['agenda']['sections'][:4]
+            ])
+
+            pt_info = ''
+            if session.get('pt_mcq') and session.get('pt_frq'):
+                pt_info = f" | MCQ: {session['pt_mcq']}% / FRQ: {session['pt_frq']}%"
+
+            html += f'''
+    <div class="session">
+        <div class="session-header">
+            <div>
+                <span class="student-name">{session['student_name']}</span>
+                <span class="course {session['course']}">{session['course']}</span>
+            </div>
+            <span class="time">{session['slot']['time']}</span>
+        </div>
+        <div class="meta">
+            Risk: {session['risk']} | PT Score: {session.get('pt_score', 'N/A')}{pt_info} | Rec: {session['recommendation']}
+        </div>
+        <div class="agenda">
+            {agenda_items}
+        </div>
+    </div>
+'''
+
+    html += '</body></html>'
+
+    # Return as downloadable HTML (browsers can save as PDF)
+    from flask import Response
+    response = Response(html, mimetype='text/html')
+    response.headers['Content-Disposition'] = 'attachment; filename=external_coach_schedule.html'
+    return response
+
+
 @app.route('/api/students')
 def api_students():
     data = load_all_data()
