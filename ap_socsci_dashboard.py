@@ -5430,7 +5430,9 @@ def generate_student_briefing(student):
             risk_reasons.append(f"{progress:.0f}% progress")
 
     if weak_units:
-        weak_str = f"Weak units: {', '.join(weak_units[:3])}"
+        # Extract unit names from dicts
+        unit_names = [u.get('unit_name', u.get('unit_id', str(u))) if isinstance(u, dict) else str(u) for u in weak_units[:3]]
+        weak_str = f"Weak units: {', '.join(unit_names)}"
         if len(weak_units) > 3:
             weak_str += f" (+{len(weak_units)-3} more)"
     else:
@@ -5477,10 +5479,15 @@ def generate_session_topic(student):
 
     # Priority 3: Content gaps - focus on weak units
     if weak_units:
+        # Extract unit names from dicts
+        def get_unit_name(u):
+            return u.get('unit_name', u.get('unit_id', str(u))) if isinstance(u, dict) else str(u)
+        first_unit = get_unit_name(weak_units[0])
+        weak_names = [get_unit_name(u) for u in weak_units[:2]]
         return {
-            'topic': f'Content Review: {weak_units[0]}',
-            'detail': f'Key content gaps in {", ".join(weak_units[:2])}. Quick concept review + practice questions.',
-            'materials': f'Bring summary sheet for {weak_units[0]} and 5-10 MCQs on this topic'
+            'topic': f'Content Review: {first_unit}',
+            'detail': f'Key content gaps in {", ".join(weak_names)}. Quick concept review + practice questions.',
+            'materials': f'Bring summary sheet for {first_unit} and 5-10 MCQs on this topic'
         }
 
     # Priority 4: Low score overall - comprehensive review
