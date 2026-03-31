@@ -5373,6 +5373,132 @@ def allocate_students_to_slots(students, slots):
     return bookings
 
 
+def generate_student_briefing(student):
+    """Generate a concise 3-line briefing for external coach."""
+    lines = []
+
+    # Line 1: Progress snapshot
+    progress = student.get('combined_progress')
+    tb_progress = student.get('timeback_progress')
+    aw_mastery = student.get('aw_mastery')
+
+    if progress:
+        progress_str = f"Course progress: {progress:.0f}%"
+        if tb_progress and aw_mastery:
+            progress_str += f" (Timeback {tb_progress:.0f}%, Austin Way {aw_mastery:.0f}%)"
+        lines.append(progress_str)
+    else:
+        lines.append("Course progress: No data available - may be new or inactive")
+
+    # Line 2: PT performance and key gap
+    pt_mcq = student.get('pt_mcq')
+    pt_frq = student.get('pt_frq')
+    pt_score = student.get('pt_score')
+
+    if pt_mcq and pt_frq:
+        gap = pt_mcq - pt_frq
+        if gap > 15:
+            lines.append(f"Practice test: {pt_score}/5 (MCQ {pt_mcq}%, FRQ {pt_frq}%) — MAJOR FRQ GAP, knows content but can't write")
+        elif gap < -15:
+            lines.append(f"Practice test: {pt_score}/5 (MCQ {pt_mcq}%, FRQ {pt_frq}%) — Content gaps, writing is fine")
+        else:
+            lines.append(f"Practice test: {pt_score}/5 (MCQ {pt_mcq}%, FRQ {pt_frq}%) — Balanced performance")
+    elif pt_score:
+        lines.append(f"Practice test: {pt_score}/5 (detailed breakdown not available)")
+    else:
+        lines.append("Practice test: NOT TAKEN — critical blind spot, no exam readiness data")
+
+    # Line 3: Weak areas and why they're at this risk level
+    weak_units = student.get('weak_units', [])
+    risk = student.get('risk', 'Unknown')
+    rec = student.get('recommendation', '')
+
+    risk_reasons = []
+    if risk == 'Critical':
+        if not pt_score:
+            risk_reasons.append("no PT score")
+        elif pt_score <= 2:
+            risk_reasons.append(f"PT score {pt_score}")
+        if progress and progress < 50:
+            risk_reasons.append(f"only {progress:.0f}% through course")
+        if not risk_reasons:
+            risk_reasons.append("multiple red flags")
+    elif risk == 'At Risk':
+        if pt_score and pt_score <= 3:
+            risk_reasons.append(f"PT score {pt_score}")
+        if progress and progress < 70:
+            risk_reasons.append(f"{progress:.0f}% progress")
+
+    if weak_units:
+        weak_str = f"Weak units: {', '.join(weak_units[:3])}"
+        if len(weak_units) > 3:
+            weak_str += f" (+{len(weak_units)-3} more)"
+    else:
+        weak_str = "Weak units: None identified"
+
+    if risk_reasons:
+        lines.append(f"{weak_str}. {risk.upper()} because: {', '.join(risk_reasons)}")
+    else:
+        lines.append(weak_str)
+
+    return lines
+
+
+def generate_session_topic(student):
+    """Generate a specific recommended topic for this session."""
+    pt_mcq = student.get('pt_mcq')
+    pt_frq = student.get('pt_frq')
+    pt_score = student.get('pt_score')
+    weak_units = student.get('weak_units', [])
+    rec = student.get('recommendation', '')
+    course = student.get('course', '')
+
+    # Priority 1: No PT - discuss exam strategy and what to expect
+    if not pt_score:
+        return {
+            'topic': 'Exam Overview & Strategy',
+            'detail': 'Walk through exam format, timing, question types. Set expectations and create study plan.',
+            'materials': 'Bring sample questions from each section to demonstrate format'
+        }
+
+    # Priority 2: Major FRQ gap - focus on writing skills
+    if pt_mcq and pt_frq and (pt_mcq - pt_frq) > 15:
+        frq_types = {
+            'APHG': 'FRQ structure (define-explain-example), using specific geographic examples',
+            'APUSH': 'SAQ/LEQ/DBQ structure, thesis writing, using specific historical evidence',
+            'APWH': 'SAQ/LEQ/DBQ structure, thesis writing, cross-regional comparisons',
+            'APGOV': 'FRQ types (Concept Application, SCOTUS Comparison, Argument Essay)'
+        }
+        return {
+            'topic': 'FRQ Writing Skills',
+            'detail': f'Student knows content (MCQ {pt_mcq}%) but struggles with writing (FRQ {pt_frq}%). Focus on {frq_types.get(course, "essay structure")}.',
+            'materials': 'Bring 1-2 sample FRQs with rubrics to practice outlining'
+        }
+
+    # Priority 3: Content gaps - focus on weak units
+    if weak_units:
+        return {
+            'topic': f'Content Review: {weak_units[0]}',
+            'detail': f'Key content gaps in {", ".join(weak_units[:2])}. Quick concept review + practice questions.',
+            'materials': f'Bring summary sheet for {weak_units[0]} and 5-10 MCQs on this topic'
+        }
+
+    # Priority 4: Low score overall - comprehensive review
+    if pt_score and pt_score <= 2:
+        return {
+            'topic': 'Exam Strategy & Triage',
+            'detail': 'With limited time, identify highest-yield topics. Focus on partial credit strategies for FRQs.',
+            'materials': 'Bring list of most-tested topics and scoring guidelines'
+        }
+
+    # Default: General exam prep
+    return {
+        'topic': 'Exam Strategy & Confidence Building',
+        'detail': 'Review test-taking strategies, time management, and stress management for exam day.',
+        'materials': 'Bring timing guide and sample pacing schedule'
+    }
+
+
 def generate_external_coach_plan(bookings):
     """Generate the full external coach plan with agendas."""
     plan = {
@@ -5397,6 +5523,10 @@ def generate_external_coach_plan(bookings):
         # Generate agenda for this student
         agenda = generate_session_agenda(student)
 
+        # Generate detailed briefing and session topic
+        briefing = generate_student_briefing(student)
+        session_topic = generate_session_topic(student)
+
         booking_detail = {
             'student_name': student.get('student', 'Unknown'),
             'course': student.get('course', 'Unknown'),
@@ -5406,8 +5536,12 @@ def generate_external_coach_plan(bookings):
             'pt_frq': student.get('pt_frq'),
             'pt_score': student.get('pt_score'),
             'recommendation': student.get('recommendation', ''),
+            'combined_progress': student.get('combined_progress'),
+            'weak_units': student.get('weak_units', []),
             'slot': slot,
             'agenda': agenda,
+            'briefing': briefing,
+            'session_topic': session_topic,
             'scheduled': True
         }
 
@@ -5563,6 +5697,38 @@ EXTERNAL_SCHEDULER_HTML = '''
         .risk-Medium, .risk-OnTrack { color: #ffaa00; }
         .risk-Low, .risk-Strong { color: #44ff44; }
 
+        .briefing {
+            background: #1e1e3a;
+            border-left: 3px solid #44dddd;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .briefing-line { color: #ccc; margin-bottom: 4px; }
+        .briefing-line:last-child { margin-bottom: 0; }
+        .briefing-highlight { color: #ff8844; font-weight: bold; }
+
+        .session-topic {
+            background: #252550;
+            border: 1px solid #44dddd;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 10px;
+        }
+        .topic-title {
+            color: #44dddd;
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 6px;
+        }
+        .topic-detail { color: #ccc; font-size: 12px; margin-bottom: 6px; }
+        .topic-materials {
+            color: #888;
+            font-size: 11px;
+            font-style: italic;
+        }
+
         .agenda-preview {
             background: #1a1a2e;
             padding: 10px;
@@ -5701,13 +5867,18 @@ EXTERNAL_SCHEDULER_HTML = '''
                 <span>Risk: <strong class="risk-{{ session.risk | replace(' ', '') }}">{{ session.risk }}</strong></span>
                 {% if session.pt_score %}<span>PT Score: <strong>{{ session.pt_score }}</strong></span>{% endif %}
                 {% if session.pt_mcq and session.pt_frq %}<span>MCQ: {{ session.pt_mcq }}% / FRQ: {{ session.pt_frq }}%</span>{% endif %}
-                <span>Rec: <strong>{{ session.recommendation }}</strong></span>
             </div>
 
-            <div class="agenda-preview">
-                {% for section in session.agenda.sections[:3] %}
-                <div class="agenda-item"><strong>{{ section.title }}:</strong> {{ section.content[0] if section.content else '' }}</div>
+            <div class="briefing">
+                {% for line in session.briefing %}
+                <div class="briefing-line">{{ line }}</div>
                 {% endfor %}
+            </div>
+
+            <div class="session-topic">
+                <div class="topic-title">Recommended: {{ session.session_topic.topic }}</div>
+                <div class="topic-detail">{{ session.session_topic.detail }}</div>
+                <div class="topic-materials">{{ session.session_topic.materials }}</div>
             </div>
         </div>
         {% endfor %}
@@ -5862,6 +6033,8 @@ def external_scheduler():
                 'course': b['course'],
                 'slot': b['slot'],
                 'agenda': b['agenda'],
+                'session_topic': b.get('session_topic', {}),
+                'briefing': b.get('briefing', []),
                 'scheduled': True
             })
 
@@ -5902,6 +6075,12 @@ def external_scheduler_pdf():
         .student-name {{ font-size: 18px; font-weight: bold; }}
         .time {{ background: #2c5282; color: white; padding: 5px 15px; border-radius: 4px; }}
         .meta {{ color: #718096; font-size: 12px; margin-bottom: 10px; }}
+        .briefing {{ background: #edf2f7; border-left: 3px solid #2c5282; padding: 10px; margin-bottom: 10px; font-size: 12px; }}
+        .briefing-line {{ margin: 4px 0; color: #4a5568; }}
+        .topic-box {{ background: #ebf8ff; border: 1px solid #2c5282; border-radius: 4px; padding: 10px; margin-bottom: 10px; }}
+        .topic-title {{ color: #2c5282; font-weight: bold; font-size: 14px; margin-bottom: 4px; }}
+        .topic-detail {{ color: #4a5568; font-size: 12px; margin-bottom: 4px; }}
+        .topic-materials {{ color: #718096; font-size: 11px; font-style: italic; }}
         .agenda {{ background: #f7fafc; padding: 10px; border-radius: 4px; }}
         .agenda-item {{ margin: 5px 0; font-size: 13px; }}
         .course {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; color: white; }}
@@ -5933,14 +6112,19 @@ def external_scheduler_pdf():
         html += f'<h2>{day["display"]} ({len(day["sessions"])} sessions)</h2>'
 
         for session in day['sessions']:
-            agenda_items = ''.join([
-                f'<div class="agenda-item"><strong>{s["title"]}:</strong> {s["content"][0] if s["content"] else ""}</div>'
-                for s in session['agenda']['sections'][:4]
-            ])
+            # Build briefing lines
+            briefing_html = ''
+            for line in session.get('briefing', []):
+                briefing_html += f'<div class="briefing-line">{line}</div>'
 
-            pt_info = ''
-            if session.get('pt_mcq') and session.get('pt_frq'):
-                pt_info = f" | MCQ: {session['pt_mcq']}% / FRQ: {session['pt_frq']}%"
+            # Build session topic
+            topic = session.get('session_topic', {})
+            topic_html = f'''
+            <div class="topic-box">
+                <div class="topic-title">Recommended: {topic.get('topic', 'Exam Strategy')}</div>
+                <div class="topic-detail">{topic.get('detail', '')}</div>
+                <div class="topic-materials">{topic.get('materials', '')}</div>
+            </div>'''
 
             html += f'''
     <div class="session">
@@ -5952,11 +6136,12 @@ def external_scheduler_pdf():
             <span class="time">{session['slot']['time']}</span>
         </div>
         <div class="meta">
-            Risk: {session['risk']} | PT Score: {session.get('pt_score', 'N/A')}{pt_info} | Rec: {session['recommendation']}
+            Risk: {session['risk']} | PT Score: {session.get('pt_score', 'N/A')}
         </div>
-        <div class="agenda">
-            {agenda_items}
+        <div class="briefing">
+            {briefing_html}
         </div>
+        {topic_html}
     </div>
 '''
 
