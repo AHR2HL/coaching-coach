@@ -3253,6 +3253,32 @@ def build_unified_table(data):
         # Generate unified coaching insights (triangulating survey + quantitative data + coaching notes)
         rows[-1]['coaching_insights'] = generate_coaching_insights(rows[-1])
 
+        # Add student daily logs data
+        student_logs = get_student_logs(student_name, course, limit=5)
+        rows[-1]['daily_logs'] = student_logs
+        if student_logs:
+            latest_log = student_logs[0]
+            rows[-1]['last_log_date'] = latest_log.get('date')
+            rows[-1]['last_log_flagged'] = latest_log.get('flagged', False)
+            rows[-1]['last_log_prediction'] = latest_log.get('prediction')
+            rows[-1]['log_action_item'] = latest_log.get('action_item', '')
+            # Check for engagement - no log in last 3 days = potentially disengaged
+            try:
+                last_log_dt = datetime.strptime(latest_log.get('date', ''), '%Y-%m-%d').date()
+                days_since_log = (datetime.now().date() - last_log_dt).days
+                rows[-1]['days_since_log'] = days_since_log
+                rows[-1]['log_stale'] = days_since_log > 3
+            except:
+                rows[-1]['days_since_log'] = None
+                rows[-1]['log_stale'] = False
+        else:
+            rows[-1]['last_log_date'] = None
+            rows[-1]['last_log_flagged'] = False
+            rows[-1]['last_log_prediction'] = None
+            rows[-1]['log_action_item'] = ''
+            rows[-1]['days_since_log'] = None
+            rows[-1]['log_stale'] = None  # No logs yet, can't determine
+
     return rows
 
 
@@ -3801,6 +3827,24 @@ DASHBOARD_HTML = '''
             height: 100%;
             background: linear-gradient(90deg, #4da6ff, #44ff44);
         }
+
+        .log-flag {
+            background: #ef4444;
+            color: #fff;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: bold;
+        }
+        .log-stale {
+            color: #ff8844;
+        }
+        .log-fresh {
+            color: #44ff44;
+        }
+        .log-none {
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -3900,6 +3944,7 @@ DASHBOARD_HTML = '''
                 <th data-sort="locked_recommendation" class="locked-col">Rec (Locked)</th>
                 <th data-sort="recommendation">Rec (Live)</th>
                 <th data-sort="daily_xp">XP/SchoolDay</th>
+                <th data-sort="last_log_date">Last Log</th>
             </tr>
         </thead>
         <tbody>
@@ -3958,6 +4003,13 @@ DASHBOARD_HTML = '''
                 </td>
                 <td class="{% if s.daily_xp >= 50 %}activity-hot{% elif s.daily_xp >= 20 %}activity-warm{% elif s.daily_xp > 0 %}activity-cold{% else %}metric-null{% endif %}">
                     {{ s.daily_xp if s.daily_xp else '—' }}
+                </td>
+                <td class="{% if s.last_log_flagged %}log-flag{% elif s.log_stale %}log-stale{% elif s.last_log_date %}log-fresh{% else %}log-none{% endif %}">
+                    {% if s.last_log_date %}
+                    {{ s.last_log_date }}{% if s.last_log_flagged %} <span class="log-flag">FLAG</span>{% endif %}{% if s.log_stale %} ({{ s.days_since_log }}d ago){% endif %}
+                    {% else %}
+                    <span class="log-none">No logs</span>
+                    {% endif %}
                 </td>
             </tr>
             {% endfor %}
@@ -4777,6 +4829,57 @@ STUDENT_HTML = '''
         </div>
         {% else %}
         <p style="color: #666; font-size: 13px; margin-top: 15px;">No coaching notes yet. Add notes after your coaching calls to track progress and patterns.</p>
+        {% endif %}
+    </div>
+
+    {# Student Daily Logs Section #}
+    <div class="chart-container" style="border-left: 4px solid #ff8844;">
+        <div class="chart-title" style="color: #ff8844;">
+            Student Daily Logs
+            {% if student.daily_logs %}
+            <span style="font-size: 12px; font-weight: normal; color: #888; margin-left: 10px;">
+                {{ student.daily_logs|length }} recent log(s)
+            </span>
+            {% endif %}
+            {% if student.last_log_flagged %}
+            <span style="background: #ef4444; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 10px;">FLAGGED</span>
+            {% endif %}
+            {% if student.log_stale %}
+            <span style="color: #ff8844; font-size: 12px; margin-left: 10px;">No log in {{ student.days_since_log }} days</span>
+            {% endif %}
+        </div>
+
+        {% if student.daily_logs %}
+        <div style="margin-top: 15px;">
+            {% for log in student.daily_logs %}
+            <div style="background: {% if log.flagged %}#3a2020{% elif log.priority %}#3a3020{% else %}#1a1a2e{% endif %}; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <span style="color: #ff8844; font-weight: bold;">{{ log.date }}</span>
+                    <div>
+                        {% if log.flagged %}<span style="background: #ef4444; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-right: 5px;">FLAG</span>{% endif %}
+                        {% if log.priority %}<span style="background: #f97316; color: #fff; padding: 2px 6px; border-radius: 3px; font-size: 10px;">PRIORITY</span>{% endif %}
+                        {% if log.prediction %}<span style="background: {% if log.prediction >= 4 %}#22c55e{% elif log.prediction == 3 %}#eab308{% else %}#ef4444{% endif %}; color: {% if log.prediction >= 3 %}#000{% else %}#fff{% endif %}; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-left: 5px;">Pred: {{ log.prediction }}</span>{% endif %}
+                    </div>
+                </div>
+
+                <p style="color: #ccc; font-size: 13px; margin-bottom: 8px;">{{ log.todays_work }}</p>
+
+                {% if log.gaps %}
+                <p style="color: #888; font-size: 12px; margin-bottom: 5px;"><strong style="color: #ffaa00;">Gaps:</strong> {{ log.gaps }}</p>
+                {% endif %}
+
+                {% if log.tomorrows_focus %}
+                <p style="color: #888; font-size: 12px; margin-bottom: 5px;"><strong style="color: #44dddd;">Tomorrow:</strong> {{ log.tomorrows_focus }}</p>
+                {% endif %}
+
+                {% if log.action_item %}
+                <p style="color: #44dddd; font-size: 12px; margin-top: 8px;"><strong>Action:</strong> {{ log.action_item }}</p>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p style="color: #666; font-size: 13px; margin-top: 15px;">No daily logs for this student yet. Logs are ingested from the <a href="/student-logs" style="color: #4da6ff;">Student Logs</a> page.</p>
         {% endif %}
     </div>
 
