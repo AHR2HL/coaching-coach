@@ -3733,6 +3733,7 @@ DASHBOARD_HTML = '''
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
+        <a href="/student-logs">Student Logs</a>
         <a href="/settings">Settings</a>
     </nav>
 
@@ -6720,6 +6721,7 @@ STUDENT_LOGS_HTML = '''
         <a href="/comms">Communications</a>
         <a href="/student-logs" style="font-weight: bold;">Student Logs</a>
         <a href="/refresh">Refresh Data</a>
+        <a href="/student-logs">Student Logs</a>
     </nav>
 
     <h1>Student Daily Logs</h1>
@@ -7411,6 +7413,7 @@ COMMS_HTML = '''
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
+        <a href="/student-logs">Student Logs</a>
         <a href="/settings">Settings</a>
     </nav>
 
@@ -8709,6 +8712,7 @@ SETTINGS_HTML = '''
         <a href="/coaching">Coaching</a>
         <a href="/comms">Communications</a>
         <a href="/refresh">Refresh Data</a>
+        <a href="/student-logs">Student Logs</a>
         <a href="/settings">Settings</a>
     </nav>
 
