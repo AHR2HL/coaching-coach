@@ -82,6 +82,7 @@ COMMS_HISTORY_FILE = BASE_DIR / 'ap_comms_history.json'
 RECOMMENDATION_LOCK_FILE = BASE_DIR / 'recommendation_lock.json'
 SELF_ASSESSMENT_DIR = BASE_DIR / 'self_assessment'
 COACHING_NOTES_FILE = BASE_DIR / 'coaching_notes.json'
+STUDENT_LOGS_FILE = BASE_DIR / 'student_logs.json'
 
 # Survey course name mapping
 SURVEY_COURSE_MAP = {
@@ -787,6 +788,156 @@ def get_coaching_patterns(student_name, course):
         'latest_sentiment': sentiments[0] if sentiments else 'unknown',
         'latest_date': notes[0].get('date') if notes else None
     }
+
+
+# =============================================================================
+# STUDENT DAILY LOGS (Self-reported work logs)
+# =============================================================================
+
+def load_student_logs():
+    """Load all student daily logs."""
+    if STUDENT_LOGS_FILE.exists():
+        try:
+            with open(STUDENT_LOGS_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {'logs': [], 'by_student': {}}
+    return {'logs': [], 'by_student': {}}
+
+
+def save_student_logs(data):
+    """Save student logs."""
+    with open(STUDENT_LOGS_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def parse_student_log_text(raw_text):
+    """
+    Parse the student log format from form submissions.
+
+    Format:
+    --- AP Human Geography (1 student(s)) ---
+    - Grady Swanson: [AP Human Geography] | Today's work: X | Gaps: Y | Prediction: 5 | Tomorrow's focus: Z | Recall: W
+    """
+    import html
+    import re
+
+    # Decode HTML entities
+    text = html.unescape(raw_text)
+
+    logs = []
+    current_course = None
+
+    for line in text.strip().split('\n'):
+        line = line.strip()
+
+        # Check for course header
+        header_match = re.match(r'^---\s*(.+?)\s*\(\d+\s*student', line)
+        if header_match:
+            current_course = header_match.group(1).strip()
+            continue
+
+        # Check for student log line
+        if line.startswith('- ') and '|' in line:
+            # Parse: - Name: [Course] | Today's work: X | Gaps: Y | ...
+            try:
+                # Extract name (before the colon)
+                name_match = re.match(r'^-\s*([^:]+):', line)
+                if not name_match:
+                    continue
+                student_name = name_match.group(1).strip()
+
+                # Extract fields using regex
+                fields = {}
+
+                # Course in brackets
+                course_match = re.search(r'\[([^\]]+)\]', line)
+                if course_match:
+                    fields['course'] = course_match.group(1).strip()
+                elif current_course:
+                    fields['course'] = current_course
+
+                # Parse pipe-separated fields
+                field_patterns = [
+                    (r"Today'?s?\s*work:\s*([^|]+)", 'todays_work'),
+                    (r"Gaps?:\s*([^|]+)", 'gaps'),
+                    (r"Prediction:\s*(\d+)", 'prediction'),
+                    (r"Tomorrow'?s?\s*focus:\s*([^|]+)", 'tomorrows_focus'),
+                    (r"Recall:\s*(.+)$", 'recall'),
+                ]
+
+                for pattern, field_name in field_patterns:
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    if match:
+                        value = match.group(1).strip()
+                        # Clean up trailing pipes
+                        value = re.sub(r'\s*\|\s*$', '', value)
+                        fields[field_name] = value
+
+                if student_name and fields:
+                    logs.append({
+                        'student': student_name,
+                        'course': fields.get('course', current_course or 'Unknown'),
+                        'todays_work': fields.get('todays_work', ''),
+                        'gaps': fields.get('gaps', ''),
+                        'prediction': int(fields.get('prediction', 0)) if fields.get('prediction') else None,
+                        'tomorrows_focus': fields.get('tomorrows_focus', ''),
+                        'recall': fields.get('recall', ''),
+                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'timestamp': datetime.now().isoformat()
+                    })
+            except Exception as e:
+                print(f"Error parsing log line: {line} - {e}")
+                continue
+
+    return logs
+
+
+def ingest_student_logs(raw_text):
+    """Parse and store student logs from form submission text."""
+    parsed_logs = parse_student_log_text(raw_text)
+
+    if not parsed_logs:
+        return {'success': False, 'error': 'No valid logs found in input', 'count': 0}
+
+    # Load existing logs
+    data = load_student_logs()
+
+    # Add new logs
+    for log in parsed_logs:
+        data['logs'].append(log)
+
+        # Index by student
+        student_key = f"{log['student']}|{log['course']}"
+        if student_key not in data['by_student']:
+            data['by_student'][student_key] = []
+        data['by_student'][student_key].append(log)
+
+    # Save
+    save_student_logs(data)
+
+    return {
+        'success': True,
+        'count': len(parsed_logs),
+        'students': [f"{l['student']} ({l['course']})" for l in parsed_logs]
+    }
+
+
+def get_student_logs(student_name, course, limit=10):
+    """Get recent logs for a specific student."""
+    data = load_student_logs()
+    student_key = f"{student_name}|{course}"
+    logs = data.get('by_student', {}).get(student_key, [])
+    # Sort by timestamp descending
+    logs = sorted(logs, key=lambda x: x.get('timestamp', ''), reverse=True)
+    return logs[:limit]
+
+
+def get_recent_logs(limit=50):
+    """Get most recent logs across all students."""
+    data = load_student_logs()
+    logs = sorted(data.get('logs', []), key=lambda x: x.get('timestamp', ''), reverse=True)
+    return logs[:limit]
 
 
 # =============================================================================
@@ -6448,6 +6599,262 @@ def api_reprocess_notes(student_name, course):
         'success': True,
         'reprocessed': reprocessed
     })
+
+
+# =============================================================================
+# STUDENT LOGS API & PAGE
+# =============================================================================
+
+STUDENT_LOGS_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Student Daily Logs - AP Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 5px; color: #fff; }
+        h2 { margin: 20px 0 10px; color: #fff; font-size: 18px; }
+        .subtitle { color: #888; margin-bottom: 20px; }
+        .nav { margin-bottom: 20px; }
+        .nav a { color: #4da6ff; margin-right: 20px; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+
+        .card {
+            background: #252540;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .card h3 { margin-bottom: 15px; color: #44dddd; }
+
+        textarea {
+            width: 100%;
+            height: 200px;
+            padding: 12px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            background: #1a1a2e;
+            color: #fff;
+            font-family: monospace;
+            font-size: 13px;
+            margin-bottom: 15px;
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .btn-primary { background: #4da6ff; color: #fff; }
+        .btn-primary:hover { background: #3d96ef; }
+
+        .result {
+            padding: 15px;
+            border-radius: 6px;
+            margin-top: 15px;
+            display: none;
+        }
+        .result.success { background: #1a3a1a; border: 1px solid #44ff44; }
+        .result.error { background: #3a1a1a; border: 1px solid #ff4444; }
+
+        .log-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .log-table th, .log-table td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+        }
+        .log-table th {
+            background: #353560;
+            color: #fff;
+        }
+        .log-table tr:hover { background: #2a2a4a; }
+
+        .prediction {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .pred-5 { background: #22c55e; color: #000; }
+        .pred-4 { background: #84cc16; color: #000; }
+        .pred-3 { background: #eab308; color: #000; }
+        .pred-2 { background: #f97316; color: #fff; }
+        .pred-1 { background: #ef4444; color: #fff; }
+
+        .course-tag {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            margin-left: 5px;
+        }
+        .course-APHG { background: #2d5a27; }
+        .course-APUSH { background: #27415a; }
+        .course-APWH { background: #5a2727; }
+        .course-APGOV { background: #5a4a27; }
+
+        .log-detail {
+            font-size: 12px;
+            color: #aaa;
+        }
+        .log-field { margin: 3px 0; }
+        .log-field strong { color: #44dddd; }
+    </style>
+</head>
+<body>
+    <nav class="nav">
+        <a href="/">Dashboard</a>
+        <a href="/planner">Planner</a>
+        <a href="/external-scheduler">External</a>
+        <a href="/comms">Communications</a>
+        <a href="/student-logs" style="font-weight: bold;">Student Logs</a>
+        <a href="/refresh">Refresh Data</a>
+    </nav>
+
+    <h1>Student Daily Logs</h1>
+    <p class="subtitle">Ingest and view student self-reported daily work logs</p>
+
+    <div class="card">
+        <h3>Paste Log Data</h3>
+        <p style="color: #888; font-size: 13px; margin-bottom: 10px;">
+            Paste the raw log text from form submissions (e.g., from Slack or email notifications)
+        </p>
+        <textarea id="log-input" placeholder="--- AP Human Geography (1 student(s)) ---
+- Grady Swanson: [AP Human Geography] | Today's work: Did math | Gaps: Did math | Prediction: 5 | Tomorrow's focus: 20 topics in good timeback | Recall: Email me if you see this."></textarea>
+        <button class="btn btn-primary" onclick="ingestLogs()">Ingest Logs</button>
+        <div id="ingest-result" class="result"></div>
+    </div>
+
+    <div class="card">
+        <h3>Recent Logs ({{ logs | length }} entries)</h3>
+        {% if logs %}
+        <table class="log-table">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Student</th>
+                    <th>Prediction</th>
+                    <th>Today's Work</th>
+                    <th>Gaps</th>
+                    <th>Tomorrow's Focus</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td>{{ log.date }}</td>
+                    <td>
+                        {{ log.student }}
+                        <span class="course-tag course-{{ log.course | replace(' ', '') | replace('APHumanGeography', 'APHG') | replace('APUSHistory', 'APUSH') | replace('APWorldHistory:Modern', 'APWH') | replace('APUSGovernment&Politics', 'APGOV') }}">
+                            {{ log.course }}
+                        </span>
+                    </td>
+                    <td>
+                        {% if log.prediction %}
+                        <span class="prediction pred-{{ log.prediction }}">{{ log.prediction }}</span>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
+                    <td style="max-width: 200px;">{{ log.todays_work[:100] }}{% if log.todays_work | length > 100 %}...{% endif %}</td>
+                    <td style="max-width: 150px;">{{ log.gaps[:80] }}{% if log.gaps | length > 80 %}...{% endif %}</td>
+                    <td style="max-width: 150px;">{{ log.tomorrows_focus[:80] }}{% if log.tomorrows_focus | length > 80 %}...{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="color: #888;">No logs ingested yet. Paste log data above to get started.</p>
+        {% endif %}
+    </div>
+
+    <script>
+    async function ingestLogs() {
+        const input = document.getElementById('log-input').value.trim();
+        const resultDiv = document.getElementById('ingest-result');
+
+        if (!input) {
+            resultDiv.className = 'result error';
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = 'Please paste log data first.';
+            return;
+        }
+
+        try {
+            const resp = await fetch('/api/student-logs/ingest', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ text: input })
+            });
+            const data = await resp.json();
+
+            if (data.success) {
+                resultDiv.className = 'result success';
+                resultDiv.innerHTML = `Ingested ${data.count} log(s):<br>${data.students.join('<br>')}`;
+                // Reload page after 2 seconds to show new logs
+                setTimeout(() => location.reload(), 2000);
+            } else {
+                resultDiv.className = 'result error';
+                resultDiv.innerHTML = `Error: ${data.error}`;
+            }
+        } catch (e) {
+            resultDiv.className = 'result error';
+            resultDiv.innerHTML = `Error: ${e.message}`;
+        }
+
+        resultDiv.style.display = 'block';
+    }
+    </script>
+</body>
+</html>
+'''
+
+
+@app.route('/student-logs')
+def student_logs_page():
+    """Student daily logs page."""
+    logs = get_recent_logs(limit=100)
+    return render_template_string(STUDENT_LOGS_HTML, logs=logs)
+
+
+@app.route('/api/student-logs/ingest', methods=['POST'])
+def api_ingest_student_logs():
+    """Ingest student logs from pasted text."""
+    req = request.json
+    raw_text = req.get('text', '')
+
+    if not raw_text:
+        return jsonify({'success': False, 'error': 'No text provided'}), 400
+
+    result = ingest_student_logs(raw_text)
+    return jsonify(result)
+
+
+@app.route('/api/student-logs/recent')
+def api_recent_student_logs():
+    """Get recent student logs."""
+    limit = request.args.get('limit', 50, type=int)
+    logs = get_recent_logs(limit=limit)
+    return jsonify({'logs': logs})
+
+
+@app.route('/api/student-logs/<student_name>/<course>')
+def api_student_logs(student_name, course):
+    """Get logs for a specific student."""
+    limit = request.args.get('limit', 10, type=int)
+    logs = get_student_logs(student_name, course, limit=limit)
+    return jsonify({'logs': logs})
 
 
 REFRESH_HTML = '''
