@@ -998,6 +998,29 @@ def get_recent_logs(limit=50):
     return logs[:limit]
 
 
+def delete_student_log(timestamp):
+    """Delete a log entry by timestamp."""
+    data = load_student_logs()
+
+    # Find and remove from main logs list
+    original_count = len(data.get('logs', []))
+    data['logs'] = [l for l in data.get('logs', []) if l.get('timestamp') != timestamp]
+    removed = original_count - len(data['logs'])
+
+    # Also remove from by_student index
+    for student_key in data.get('by_student', {}):
+        data['by_student'][student_key] = [
+            l for l in data['by_student'][student_key]
+            if l.get('timestamp') != timestamp
+        ]
+
+    if removed > 0:
+        save_student_logs(data)
+        return {'success': True, 'removed': removed}
+    else:
+        return {'success': False, 'error': 'Log not found'}
+
+
 # =============================================================================
 # COACHING PLANNER - Need Assessment & Time Allocation
 # =============================================================================
@@ -6831,11 +6854,12 @@ STUDENT_LOGS_HTML = '''
                     <th>Status</th>
                     <th>Summary / Today's Work</th>
                     <th>Action Item</th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
                 {% for log in logs %}
-                <tr{% if log.flagged %} style="background: #3a2020;"{% elif log.priority %} style="background: #3a3020;"{% endif %}>
+                <tr id="log-{{ loop.index0 }}"{% if log.flagged %} style="background: #3a2020;"{% elif log.priority %} style="background: #3a3020;"{% endif %}>
                     <td>{{ log.date }}</td>
                     <td>
                         {{ log.student }}
@@ -6864,6 +6888,9 @@ STUDENT_LOGS_HTML = '''
                         {% else %}
                         -
                         {% endif %}
+                    </td>
+                    <td>
+                        <button onclick="deleteLog('{{ log.timestamp }}')" style="background: #ef4444; color: #fff; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">Delete</button>
                     </td>
                 </tr>
                 {% endfor %}
@@ -6910,6 +6937,27 @@ STUDENT_LOGS_HTML = '''
 
         resultDiv.style.display = 'block';
     }
+
+    async function deleteLog(timestamp) {
+        if (!confirm('Delete this log entry?')) return;
+
+        try {
+            const resp = await fetch('/api/student-logs/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ timestamp: timestamp })
+            });
+            const data = await resp.json();
+
+            if (data.success) {
+                location.reload();
+            } else {
+                alert('Error: ' + data.error);
+            }
+        } catch (e) {
+            alert('Error: ' + e.message);
+        }
+    }
     </script>
 </body>
 </html>
@@ -6950,6 +6998,19 @@ def api_student_logs(student_name, course):
     limit = request.args.get('limit', 10, type=int)
     logs = get_student_logs(student_name, course, limit=limit)
     return jsonify({'logs': logs})
+
+
+@app.route('/api/student-logs/delete', methods=['POST'])
+def api_delete_student_log():
+    """Delete a student log by timestamp."""
+    req = request.json
+    timestamp = req.get('timestamp', '')
+
+    if not timestamp:
+        return jsonify({'success': False, 'error': 'No timestamp provided'}), 400
+
+    result = delete_student_log(timestamp)
+    return jsonify(result)
 
 
 REFRESH_HTML = '''
