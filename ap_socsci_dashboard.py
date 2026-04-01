@@ -813,11 +813,18 @@ def save_student_logs(data):
 
 def parse_student_log_text(raw_text):
     """
-    Parse the student log format from form submissions.
+    Parse student log formats from form submissions or summary reports.
 
-    Format:
+    Format 1 (Raw form data):
     --- AP Human Geography (1 student(s)) ---
     - Grady Swanson: [AP Human Geography] | Today's work: X | Gaps: Y | Prediction: 5 | Tomorrow's focus: Z | Recall: W
+
+    Format 2 (Summary report):
+    --- AP Human Geography (5 student(s)) ---
+    - Jessica Owenby: Completed 1 Human Geography lesson and reviewed urban change topics; check in on confusing question wording.
+    - Grady Swanson: Logged unrelated math work instead of Human Geography; flag: disengaged.
+    Priority: Grady Swanson, Jessica Owenby
+    Questions: Is Grady actually working on HuGeo?
     """
     import html
     import re
@@ -827,68 +834,119 @@ def parse_student_log_text(raw_text):
 
     logs = []
     current_course = None
+    current_priority = []
+    current_questions = []
 
-    for line in text.strip().split('\n'):
-        line = line.strip()
+    lines = text.strip().split('\n')
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+
+        if not line:
+            continue
 
         # Check for course header
         header_match = re.match(r'^---\s*(.+?)\s*\(\d+\s*student', line)
         if header_match:
             current_course = header_match.group(1).strip()
+            current_priority = []
+            current_questions = []
             continue
 
-        # Check for student log line
-        if line.startswith('- ') and '|' in line:
-            # Parse: - Name: [Course] | Today's work: X | Gaps: Y | ...
-            try:
-                # Extract name (before the colon)
-                name_match = re.match(r'^-\s*([^:]+):', line)
-                if not name_match:
-                    continue
-                student_name = name_match.group(1).strip()
+        # Check for Priority line
+        if line.startswith('Priority:'):
+            priority_text = line[9:].strip()
+            current_priority = [p.strip() for p in priority_text.split(',')]
+            continue
 
-                # Extract fields using regex
-                fields = {}
+        # Check for Questions line
+        if line.startswith('Questions:') or line.startswith('Question:'):
+            current_questions.append(line.split(':', 1)[1].strip())
+            continue
 
-                # Course in brackets
-                course_match = re.search(r'\[([^\]]+)\]', line)
-                if course_match:
-                    fields['course'] = course_match.group(1).strip()
-                elif current_course:
-                    fields['course'] = current_course
-
-                # Parse pipe-separated fields
-                field_patterns = [
-                    (r"Today'?s?\s*work:\s*([^|]+)", 'todays_work'),
-                    (r"Gaps?:\s*([^|]+)", 'gaps'),
-                    (r"Prediction:\s*(\d+)", 'prediction'),
-                    (r"Tomorrow'?s?\s*focus:\s*([^|]+)", 'tomorrows_focus'),
-                    (r"Recall:\s*(.+)$", 'recall'),
-                ]
-
-                for pattern, field_name in field_patterns:
-                    match = re.search(pattern, line, re.IGNORECASE)
-                    if match:
-                        value = match.group(1).strip()
-                        # Clean up trailing pipes
-                        value = re.sub(r'\s*\|\s*$', '', value)
-                        fields[field_name] = value
-
-                if student_name and fields:
-                    logs.append({
-                        'student': student_name,
-                        'course': fields.get('course', current_course or 'Unknown'),
-                        'todays_work': fields.get('todays_work', ''),
-                        'gaps': fields.get('gaps', ''),
-                        'prediction': int(fields.get('prediction', 0)) if fields.get('prediction') else None,
-                        'tomorrows_focus': fields.get('tomorrows_focus', ''),
-                        'recall': fields.get('recall', ''),
-                        'date': datetime.now().strftime('%Y-%m-%d'),
-                        'timestamp': datetime.now().isoformat()
-                    })
-            except Exception as e:
-                print(f"Error parsing log line: {line} - {e}")
+        # Check for student log line (starts with "- Name:")
+        if line.startswith('- '):
+            # Extract name (before the colon)
+            name_match = re.match(r'^-\s*([^:]+):', line)
+            if not name_match:
                 continue
+
+            student_name = name_match.group(1).strip()
+            rest_of_line = line[name_match.end():].strip()
+
+            # Determine format by checking for pipe separators
+            if '|' in rest_of_line:
+                # Format 1: Pipe-separated fields
+                try:
+                    fields = {}
+
+                    # Course in brackets
+                    course_match = re.search(r'\[([^\]]+)\]', rest_of_line)
+                    if course_match:
+                        fields['course'] = course_match.group(1).strip()
+
+                    # Parse pipe-separated fields
+                    field_patterns = [
+                        (r"Today'?s?\s*work:\s*([^|]+)", 'todays_work'),
+                        (r"Gaps?:\s*([^|]+)", 'gaps'),
+                        (r"Prediction:\s*(\d+)", 'prediction'),
+                        (r"Tomorrow'?s?\s*focus:\s*([^|]+)", 'tomorrows_focus'),
+                        (r"Recall:\s*(.+)$", 'recall'),
+                    ]
+
+                    for pattern, field_name in field_patterns:
+                        match = re.search(pattern, rest_of_line, re.IGNORECASE)
+                        if match:
+                            value = match.group(1).strip()
+                            value = re.sub(r'\s*\|\s*$', '', value)
+                            fields[field_name] = value
+
+                    if fields:
+                        logs.append({
+                            'student': student_name,
+                            'course': fields.get('course', current_course or 'Unknown'),
+                            'todays_work': fields.get('todays_work', ''),
+                            'gaps': fields.get('gaps', ''),
+                            'prediction': int(fields.get('prediction', 0)) if fields.get('prediction') else None,
+                            'tomorrows_focus': fields.get('tomorrows_focus', ''),
+                            'recall': fields.get('recall', ''),
+                            'date': datetime.now().strftime('%Y-%m-%d'),
+                            'timestamp': datetime.now().isoformat(),
+                            'format': 'raw'
+                        })
+                except Exception as e:
+                    print(f"Error parsing raw log line: {line} - {e}")
+            else:
+                # Format 2: Summary report (no pipes)
+                # The rest of the line is a summary with action items
+                summary = rest_of_line
+
+                # Try to split on semicolon to separate work done from action items
+                parts = summary.split(';')
+                work_summary = parts[0].strip() if parts else summary
+                action_item = '; '.join(parts[1:]).strip() if len(parts) > 1 else ''
+
+                # Check for flags
+                is_flagged = 'flag:' in summary.lower() or 'flag ' in summary.lower()
+
+                logs.append({
+                    'student': student_name,
+                    'course': current_course or 'Unknown',
+                    'todays_work': work_summary,
+                    'gaps': '',
+                    'prediction': None,
+                    'tomorrows_focus': '',
+                    'recall': '',
+                    'summary': summary,
+                    'action_item': action_item,
+                    'flagged': is_flagged,
+                    'priority': student_name in current_priority,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'timestamp': datetime.now().isoformat(),
+                    'format': 'summary'
+                })
 
     return logs
 
@@ -6704,6 +6762,7 @@ STUDENT_LOGS_HTML = '''
         .course-APUSH { background: #27415a; }
         .course-APWH { background: #5a2727; }
         .course-APGOV { background: #5a4a27; }
+        .course-APCSA { background: #4a275a; }
 
         .log-detail {
             font-size: 12px;
@@ -6711,6 +6770,30 @@ STUDENT_LOGS_HTML = '''
         }
         .log-field { margin: 3px 0; }
         .log-field strong { color: #44dddd; }
+
+        .flag-badge {
+            background: #ef4444;
+            color: #fff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        .priority-badge {
+            background: #f97316;
+            color: #fff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        .action-item {
+            color: #44dddd;
+            font-size: 11px;
+            margin-top: 4px;
+        }
     </style>
 </head>
 <body>
@@ -6721,7 +6804,6 @@ STUDENT_LOGS_HTML = '''
         <a href="/comms">Communications</a>
         <a href="/student-logs" style="font-weight: bold;">Student Logs</a>
         <a href="/refresh">Refresh Data</a>
-        <a href="/student-logs">Student Logs</a>
     </nav>
 
     <h1>Student Daily Logs</h1>
@@ -6746,21 +6828,22 @@ STUDENT_LOGS_HTML = '''
                 <tr>
                     <th>Date</th>
                     <th>Student</th>
-                    <th>Prediction</th>
-                    <th>Today's Work</th>
-                    <th>Gaps</th>
-                    <th>Tomorrow's Focus</th>
+                    <th>Status</th>
+                    <th>Summary / Today's Work</th>
+                    <th>Action Item</th>
                 </tr>
             </thead>
             <tbody>
                 {% for log in logs %}
-                <tr>
+                <tr{% if log.flagged %} style="background: #3a2020;"{% elif log.priority %} style="background: #3a3020;"{% endif %}>
                     <td>{{ log.date }}</td>
                     <td>
                         {{ log.student }}
-                        <span class="course-tag course-{{ log.course | replace(' ', '') | replace('APHumanGeography', 'APHG') | replace('APUSHistory', 'APUSH') | replace('APWorldHistory:Modern', 'APWH') | replace('APUSGovernment&Politics', 'APGOV') }}">
+                        <span class="course-tag course-{{ log.course | replace(' ', '') | replace('APHumanGeography', 'APHG') | replace('APUSHistory', 'APUSH') | replace('APWorldHistory:Modern', 'APWH') | replace('APUSGovernment&Politics', 'APGOV') | replace('APComputerScienceA', 'APCSA') | replace('APUnitedStatesHistory', 'APUSH') }}">
                             {{ log.course }}
                         </span>
+                        {% if log.flagged %}<span class="flag-badge">FLAG</span>{% endif %}
+                        {% if log.priority %}<span class="priority-badge">PRIORITY</span>{% endif %}
                     </td>
                     <td>
                         {% if log.prediction %}
@@ -6769,9 +6852,19 @@ STUDENT_LOGS_HTML = '''
                         -
                         {% endif %}
                     </td>
-                    <td style="max-width: 200px;">{{ log.todays_work[:100] }}{% if log.todays_work | length > 100 %}...{% endif %}</td>
-                    <td style="max-width: 150px;">{{ log.gaps[:80] }}{% if log.gaps | length > 80 %}...{% endif %}</td>
-                    <td style="max-width: 150px;">{{ log.tomorrows_focus[:80] }}{% if log.tomorrows_focus | length > 80 %}...{% endif %}</td>
+                    <td style="max-width: 350px;">
+                        {{ log.todays_work[:150] }}{% if log.todays_work | length > 150 %}...{% endif %}
+                        {% if log.gaps %}<div class="action-item">Gaps: {{ log.gaps[:80] }}</div>{% endif %}
+                    </td>
+                    <td style="max-width: 200px;">
+                        {% if log.action_item %}
+                        {{ log.action_item[:100] }}{% if log.action_item | length > 100 %}...{% endif %}
+                        {% elif log.tomorrows_focus %}
+                        Tomorrow: {{ log.tomorrows_focus[:80] }}{% if log.tomorrows_focus | length > 80 %}...{% endif %}
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
