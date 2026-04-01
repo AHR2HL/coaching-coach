@@ -981,13 +981,39 @@ def ingest_student_logs(raw_text):
     }
 
 
+def normalize_course_name(course):
+    """Normalize course name for matching."""
+    course_lower = course.lower()
+    if 'geography' in course_lower or course_lower == 'aphg':
+        return 'APHG'
+    elif 'world' in course_lower or course_lower == 'apwh':
+        return 'APWH'
+    elif 'united states history' in course_lower or 'us history' in course_lower or course_lower == 'apush':
+        return 'APUSH'
+    elif 'government' in course_lower or course_lower == 'apgov':
+        return 'APGOV'
+    elif 'computer science' in course_lower or course_lower == 'apcsa':
+        return 'APCSA'
+    return course
+
+
 def get_student_logs(student_name, course, limit=10):
     """Get recent logs for a specific student."""
     data = load_student_logs()
-    student_key = f"{student_name}|{course}"
-    logs = data.get('by_student', {}).get(student_key, [])
+
+    # Normalize the course we're looking for
+    target_course = normalize_course_name(course)
+
+    # Search through all logs for matching student and course
+    matching_logs = []
+    for log in data.get('logs', []):
+        if log.get('student') == student_name:
+            log_course = normalize_course_name(log.get('course', ''))
+            if log_course == target_course:
+                matching_logs.append(log)
+
     # Sort by timestamp descending
-    logs = sorted(logs, key=lambda x: x.get('timestamp', ''), reverse=True)
+    logs = sorted(matching_logs, key=lambda x: x.get('timestamp', ''), reverse=True)
     return logs[:limit]
 
 
